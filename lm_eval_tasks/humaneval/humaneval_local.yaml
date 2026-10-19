@@ -1,0 +1,42 @@
+# Local override of lm-eval's built-in `humaneval` task.
+#
+# Two problems with the upstream task against a chat/instruct model (not the
+# base/completion model it was designed for):
+#   1. `until` includes "\ndef"/"\nclass"/etc. to stop a *base* model from
+#      generating a second function. A chat model routinely restates the
+#      function's own signature as part of its answer, so this stops
+#      generation almost immediately after the model's own re-declaration —
+#      the grader ends up seeing only a few characters (e.g. a lone
+#      "```python"). Replaced with the model's own EOS/turn-end tokens.
+#   2. `build_predictions` does `doc["prompt"] + completion` assuming a raw,
+#      un-fenced continuation. Chat models wrap answers in markdown code
+#      fences and restate the signature, which breaks the concatenation
+#      (leading "```python" is a syntax error). See utils.py's
+#      `_extract_code`/`_prompt_header` for the fix.
+task: humaneval_local
+dataset_path: openai/openai_humaneval
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: "{{prompt}}"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function utils.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  max_gen_toks: 1024
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.build_predictions
+metadata:
+  version: 1.0-local

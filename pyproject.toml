@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-dllm-relax"
+version = "0.1.0"
+description = "Fast-dLLM v2 compiled with Apache TVM Relax: export, runtime, and lm-eval benchmarking"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# TVM itself is not a dependency here: it is built from the pinned 3rdparty/tvm submodule
+# (scripts/setup_tvm.sh) and put on PYTHONPATH. Versions below are the ones all reported
+# numbers were produced with; torch must match your CUDA install (e.g. the cu128 wheel).
+dependencies = [
+    "torch==2.10.0",
+    "transformers==4.53.1",
+    "accelerate==0.34.2",
+    "lm_eval==0.4.8",
+    "datasets==4.6.1",
+    "numpy==2.4.2",
+    "ml_dtypes==0.5.4",
+    "einops==0.8.2",  # required by the Fast-dLLM trust_remote_code modeling file
+    "psutil",
+]
+
+[project.optional-dependencies]
+# Task-specific metric dependencies (ifeval, MATH, code tasks) and NVML memory metrics.
+eval = [
+    "langdetect",
+    "immutabledict",
+    "nltk",
+    "sympy",
+    "math-verify==0.9.0",
+    "antlr4-python3-runtime==4.11.0",
+    "evaluate",
+    "nvidia-ml-py",
+]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["fast_dllm_relax*"]

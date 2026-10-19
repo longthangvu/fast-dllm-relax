@@ -1,0 +1,17 @@
+# build / runtime outputs
+artifacts/
+results/
+*.so
+*.npz
+*.tar
+*.dylib
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+venv/
+.venv/
+.offload_fast_dllm/
+logs/

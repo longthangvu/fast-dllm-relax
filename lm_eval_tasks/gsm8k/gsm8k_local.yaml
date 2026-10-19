@@ -1,0 +1,53 @@
+# Local override of lm-eval's built-in `gsm8k` task: replaces the trailing
+# "Answer:" cue with an explicit chain-of-thought + \boxed{} instruction,
+# matching the prompt rewrite the official Fast-dLLM v2 eval harness applies
+# at runtime (Fast-dLLM/v2/eval.py: `question.replace("Answer:", "Please
+# reason step by step, and put your final answer within \\boxed{{}}.")`).
+# GSM8K's own "flexible-extract" filter (last number-like token anywhere in
+# the response) already handles a \boxed{X}-terminated answer fine — no
+# filter changes needed, unlike MATH's phrase-anchored exact_match.
+tag:
+  - math_word_problems_local
+task: gsm8k_local
+dataset_path: gsm8k
+dataset_name: main
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: test
+doc_to_text: "Question: {{question}}\nPlease reason step by step, and put your final answer within \\boxed{}."
+doc_to_target: "{{answer}}"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+repeats: 1
+num_fewshot: 5
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "regex"
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: "take_first"
+metadata:
+  version: 3.0-local

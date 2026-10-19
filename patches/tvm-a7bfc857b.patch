@@ -1,0 +1,279 @@
+diff --git a/cmake/modules/CUDA.cmake b/cmake/modules/CUDA.cmake
+index be0c7b382..ac5b8a08d 100644
+--- a/cmake/modules/CUDA.cmake
++++ b/cmake/modules/CUDA.cmake
+@@ -137,6 +137,30 @@ if(USE_CUDA)
+   # Add CUDA builtins to RelaxVM
+   tvm_file_glob(GLOB VM_CUDA_BUILTIN_SRC_CC src/runtime/vm/cuda/*.cc)
+   list(APPEND RUNTIME_SRCS ${VM_CUDA_BUILTIN_SRC_CC})
++
++  if(USE_CUTLASS)
++    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
++      set(CMAKE_CUDA_COMPILER ${CUDA_TOOLKIT_ROOT_DIR}/bin/nvcc)
++      execute_process(
++        COMMAND ${CMAKE_CUDA_COMPILER} --version
++        OUTPUT_VARIABLE NVCC_VERSION_OUTPUT
++      )
++      if(NVCC_VERSION_OUTPUT MATCHES "release ([^,]+),")
++        set(CUDA_VERSION "${CMAKE_MATCH_1}")
++      endif(NVCC_VERSION_OUTPUT MATCHES "release ([^,]+),")
++      message(STATUS "CUDA_VERSION=${CUDA_VERSION}")
++
++      if(CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
++        set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
++      else(CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
++        set(CMAKE_CUDA_ARCHITECTURES "75;80;86")
++      endif(CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
++      message(STATUS "Set CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
++    else(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
++      message(STATUS "Found CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
++    endif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
++  endif(USE_CUTLASS)
++
+ else(USE_CUDA)
+   list(APPEND COMPILER_SRCS src/target/opt/build_cuda_off.cc)
+ endif(USE_CUDA)
+diff --git a/python/tvm/contrib/cutlass/gemm_operation.py b/python/tvm/contrib/cutlass/gemm_operation.py
+index 372f26943..164856e51 100644
+--- a/python/tvm/contrib/cutlass/gemm_operation.py
++++ b/python/tvm/contrib/cutlass/gemm_operation.py
+@@ -347,7 +347,7 @@ def instantiate_gemm_template(attrs):
+   status = gemm_op.initialize(arguments, workspace.get());
+   TVM_FFI_ICHECK(status == cutlass::Status::kSuccess);
+ 
+-  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, ${A_arg}->device.device_id));
++  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, ${lhs_arg}->device.device_id));
+ 
+   status = gemm_op(stream);
+   TVM_FFI_ICHECK(status == cutlass::Status::kSuccess);
+diff --git a/python/tvm/contrib/cutlass/gen_tensor_op.py b/python/tvm/contrib/cutlass/gen_tensor_op.py
+index eab4c46c5..5961b5107 100644
+--- a/python/tvm/contrib/cutlass/gen_tensor_op.py
++++ b/python/tvm/contrib/cutlass/gen_tensor_op.py
+@@ -757,7 +757,7 @@ def instantiate_template(func_name, annotations, func_args):
+         attrs["head_dim_value"] = h_v = annotations["head_dim_value"]
+         attrs["kMaxK"] = max(int(attrs["head_dim"]), int(attrs["head_dim_value"]))
+         attrs["scale"] = (
+-            float(1 / math.sqrt(h.value)) if annotations["scale"] is None else annotations["scale"]
++            float(1 / math.sqrt(int(h))) if annotations["scale"] is None else annotations["scale"]
+         )
+ 
+         if is_var_len:
+diff --git a/python/tvm/relax/backend/cuda/cublas.py b/python/tvm/relax/backend/cuda/cublas.py
+index a0907a767..f01724cf8 100644
+--- a/python/tvm/relax/backend/cuda/cublas.py
++++ b/python/tvm/relax/backend/cuda/cublas.py
+@@ -78,6 +78,13 @@ def _check_matmul(context: PatternCheckContext) -> bool:
+         # Reduction axis must be constant
+         return False
+ 
++    if len(lhs_shape) > 2 and len(rhs_shape) > 2:
++        # Reject batched-×-batched matmuls (e.g. attention q@k, probs@v).
++        # CallCublasLt's batch-count assertion fails when the batch dims differ,
++        # and cuBLAS batched-GEMM provides no advantage over DLight for these shapes.
++        # Projection GEMMs always have a 2D weight (rhs), so they are unaffected.
++        return False
++
+     if lhs_dtype == "int8" and rhs_dtype == "int8":
+         if lhs_shape[-1] % 4 != 0:
+             # Reduction axis must be multiples of 4 for IGEMM
+diff --git a/python/tvm/s_tir/dlight/gpu/matmul.py b/python/tvm/s_tir/dlight/gpu/matmul.py
+index ef9392cc2..18af93e85 100644
+--- a/python/tvm/s_tir/dlight/gpu/matmul.py
++++ b/python/tvm/s_tir/dlight/gpu/matmul.py
+@@ -578,10 +578,12 @@ class MatmulTensorization(GPUScheduleRule):
+         i0, i1, i2, i3 = sch.split(i, factors=i_factors)
+         j0, j1, j2, j3 = sch.split(j, factors=j_factors)
+         k0, k1 = sch.split(k, k_factors)
+-        sch.annotate(k0, "software_pipeline_order", [0, 3, 1, 4, 5, 2, 6])
+-        sch.annotate(k0, "software_pipeline_stage", [0, 0, 0, 0, 0, 1, 1])
+-        sch.annotate(k1, "software_pipeline_order", [0, 1, 2])
+-        sch.annotate(k1, "software_pipeline_stage", [0, 0, 1])
++        arch = target.attrs.get("arch", "")
++        if arch.startswith("sm_") and int(arch[-2:]) > 75:
++            sch.annotate(k0, "software_pipeline_order", [0, 3, 1, 4, 5, 2, 6])
++            sch.annotate(k0, "software_pipeline_stage", [0, 0, 0, 0, 0, 1, 1])
++            sch.annotate(k1, "software_pipeline_order", [0, 1, 2])
++            sch.annotate(k1, "software_pipeline_stage", [0, 0, 1])
+ 
+         sch.reorder(i0, j0, i1, j1, j2, i2, k0, k1, i3, j3)
+ 
+@@ -799,10 +801,12 @@ class MatmulInt8Tensorization(GPUScheduleRule):
+         i0, i1, i2, i3 = sch.split(i, factors=i_factors)
+         j0, j1, j2, j3 = sch.split(j, factors=j_factors)
+         k0, k1 = sch.split(k, k_factors)
+-        sch.annotate(k0, "software_pipeline_order", [0, 3, 1, 4, 5, 2, 6])
+-        sch.annotate(k0, "software_pipeline_stage", [0, 0, 0, 0, 0, 1, 1])
+-        sch.annotate(k1, "software_pipeline_order", [0, 1, 2])
+-        sch.annotate(k1, "software_pipeline_stage", [0, 0, 1])
++        arch = target.attrs.get("arch", "")
++        if arch.startswith("sm_") and int(arch[-2:]) > 75:
++            sch.annotate(k0, "software_pipeline_order", [0, 3, 1, 4, 5, 2, 6])
++            sch.annotate(k0, "software_pipeline_stage", [0, 0, 0, 0, 0, 1, 1])
++            sch.annotate(k1, "software_pipeline_order", [0, 1, 2])
++            sch.annotate(k1, "software_pipeline_stage", [0, 0, 1])
+ 
+         sch.reorder(i0, j0, i1, j1, j2, i2, k0, k1, i3, j3)
+ 
+diff --git a/python/tvm/topi/nn/batch_matmul.py b/python/tvm/topi/nn/batch_matmul.py
+index 5143238d7..094467241 100644
+--- a/python/tvm/topi/nn/batch_matmul.py
++++ b/python/tvm/topi/nn/batch_matmul.py
+@@ -91,7 +91,12 @@ def batch_matmul(
+     else:
+         YB, YK, YJ = get_const_tuple(tensor_b.shape)
+ 
+-    assert XK == YK or isinstance(YK, tvm.tirx.expr.Var), "shapes of x and y are inconsistent"
++    # Accept symbolic (non-concrete) shapes without equality check; only verify concrete dims.
++    _xk_concrete = isinstance(XK, (int, tvm.tirx.IntImm))
++    _yk_concrete = isinstance(YK, (int, tvm.tirx.IntImm))
++    assert (
++        not (_xk_concrete and _yk_concrete) or int(XK) == int(YK)
++    ), "shapes of x and y are inconsistent"
+     k = te.reduce_axis((0, XK), name="k")
+     if oshape is None:
+         assert XB == YB or XB == 1 or YB == 1, "batch dimension doesn't match"
+diff --git a/src/arith/iter_affine_map.cc b/src/arith/iter_affine_map.cc
+index 0e996485a..2e153b540 100644
+--- a/src/arith/iter_affine_map.cc
++++ b/src/arith/iter_affine_map.cc
+@@ -2142,6 +2142,14 @@ bool IterMapRewriter::CanProveDivisible(const PrimExpr& lhs, const PrimExpr& rhs
+     return clhs->value % crhs->value == 0;
+   }
+ 
++  // (a * b) % a == 0 trivially.  Handles e.g. (prefix_len + 32) * k divisible by
++  // (prefix_len + 32) which arises from GQA attention matmuls with symbolic seq lengths.
++  if (const auto* mul = lhs.as<MulNode>()) {
++    if (analyzer_->CanProveEqual(mul->a, rhs) || analyzer_->CanProveEqual(mul->b, rhs)) {
++      return true;
++    }
++  }
++
+   IterMapToExprNormalizer normalizer(analyzer_);
+   PrimExpr dividend = normalizer.Convert(lhs);
+   PrimExpr divisor = normalizer.Convert(rhs);
+diff --git a/src/relax/backend/contrib/codegen_c/codegen_c.h b/src/relax/backend/contrib/codegen_c/codegen_c.h
+index 03eb51463..2559a8bac 100644
+--- a/src/relax/backend/contrib/codegen_c/codegen_c.h
++++ b/src/relax/backend/contrib/codegen_c/codegen_c.h
+@@ -212,6 +212,42 @@ class CodegenCBase {
+     code_stream_ << "}\n";
+     code_stream_ << "#endif\n";
+ 
++    // Generate __tvm_ffi_<name> symbol so the new-FFI library module can find the function.
++    // The new TVM FFI's GetSymbolWithSymbolPrefix prepends "__tvm_ffi_" to the lookup name
++    // and expects the 4-arg safe-call ABI: (void* self, const AnyView* args, int32_t n, AnyView* rv).
++    // Input args may include non-NDArray values (e.g. ffi::Shape for symbolic shapes); those get
++    // nullptr since CUTLASS-generated kernels read shapes from the tensor descriptors directly.
++    code_stream_ << "#ifdef __cplusplus\n";
++    code_stream_ << "extern \"C\" {\n";
++    code_stream_ << "#endif\n";
++    code_stream_ << "TVM_FFI_DLL_EXPORT int32_t __tvm_ffi_" << func_name << "(";
++    code_stream_ << "void* self_p_, const tvm::ffi::AnyView* args_p_, int32_t num_args_p_,";
++    code_stream_ << " tvm::ffi::AnyView* rv_p_) {\n";
++    // Extract input tensors; pass nullptr for any arg that isn't a tensor (e.g. ffi::Shape for
++    // symbolic shape args). try_cast handles both kTVMFFIDLTensorPtr and kTVMFFITensor.
++    for (size_t i = 0; i < arg_types.size(); i++) {
++      code_stream_ << "  DLTensor* arg" << i << "_ = args_p_[" << i
++                   << "].try_cast<DLTensor*>().value_or(nullptr);\n";
++    }
++    // Extract output tensors (always NDArray).
++    for (size_t i = 0; i < outs.size(); i++) {
++      code_stream_ << "  DLTensor* ret" << (arg_types.size() + i) << "_ = args_p_["
++                   << (arg_types.size() + i) << "].try_cast<DLTensor*>().value_or(nullptr);\n";
++    }
++    code_stream_ << "  " << func_name << "_wrapper_(";
++    for (size_t i = 0; i < arg_types.size(); i++) {
++      code_stream_ << "arg" << i << "_,";
++    }
++    for (size_t i = 0; i < outs.size() - 1; i++) {
++      code_stream_ << "ret" << (arg_types.size() + i) << "_,";
++    }
++    code_stream_ << "ret" << (arg_types.size() + outs.size() - 1) << "_);\n";
++    code_stream_ << "  return 0;\n";
++    code_stream_ << "}\n";
++    code_stream_ << "#ifdef __cplusplus\n";
++    code_stream_ << "}\n";
++    code_stream_ << "#endif\n";
++
+     if (!const_arr_name.empty()) {
+       // If there are constants, insert the __init_ and the wrapper
+       // This segment would be generated in C++ because of the usage
+diff --git a/src/target/opt/build_metal_off.cc b/src/target/opt/build_metal_off.cc
+index 7f544d92f..c1f51fb19 100644
+--- a/src/target/opt/build_metal_off.cc
++++ b/src/target/opt/build_metal_off.cc
+@@ -19,18 +19,71 @@
+ 
+ /*!
+  *  Optional module when build metal is switched to off
++ *
++ *  Local patch: the stock fallback returned a generic DeviceSourceModule, whose
++ *  SaveToBytes layout (fmt, fmap, source) does not match what the Metal runtime's
++ *  ffi.Module.load_from_bytes.metal reads (version, smap, fmap, fmt) -- so a Metal artifact
++ *  cross-compiled on a USE_METAL=OFF host failed to load on the Mac (std::bad_alloc while
++ *  deserializing). This source-only module keeps the per-kernel smap and serializes it in
++ *  MetalModuleNode's exact layout (src/runtime/metal/metal_module.mm SaveToBytes), so the
++ *  exported library loads on a Metal-enabled runtime.
+  */
++#include <tvm/support/io.h>
++
+ #include "../../runtime/metal/metal_module.h"
++#include "../../support/bytes_io.h"
+ #include "../source/codegen_source_base.h"
+ 
+ namespace tvm {
+ namespace runtime {
+ 
++// Must match kMetalModuleVersion in src/runtime/metal/metal_module.mm.
++static constexpr const char* kMetalModuleVersionForCrossCompile = "0.1.0";
++
++class MetalSourceOnlyModuleNode final : public ffi::ModuleObj {
++ public:
++  MetalSourceOnlyModuleNode(std::unordered_map<std::string, std::string> smap,
++                            ffi::Map<ffi::String, FunctionInfo> fmap, std::string fmt,
++                            std::string source)
++      : smap_(std::move(smap)), fmap_(fmap), fmt_(std::move(fmt)), source_(std::move(source)) {}
++
++  const char* kind() const final { return "metal"; }
++
++  int GetPropertyMask() const final { return ffi::Module::kBinarySerializable; }
++
++  ffi::Optional<ffi::Function> GetFunction(const ffi::String& name) final {
++    TVM_FFI_THROW(InternalError) << "Metal source module cannot execute; build TVM with Metal "
++                                 << "runtime support or load the exported library on a Mac";
++  }
++
++  ffi::String InspectSource(const ffi::String& format) const final { return source_; }
++
++  ffi::Bytes SaveToBytes() const final {
++    std::string result;
++    support::BytesOutStream stream(&result);
++    std::string version = kMetalModuleVersionForCrossCompile;
++    stream.Write(version);
++    stream.Write(smap_);
++    stream.Write(fmap_);
++    stream.Write(fmt_);
++    return ffi::Bytes(std::move(result));
++  }
++
++ private:
++  std::unordered_map<std::string, std::string> smap_;
++  ffi::Map<ffi::String, FunctionInfo> fmap_;
++  std::string fmt_;
++  std::string source_;
++};
++
+ ffi::Module MetalModuleCreate(std::unordered_map<std::string, std::string> smap,
+                               ffi::Map<ffi::String, FunctionInfo> fmap, std::string fmt,
+                               std::string source) {
+-  LOG(WARNING) << "Metal runtime not enabled, return a source module...";
+-  return codegen::DeviceSourceModuleCreate(source, fmt, fmap, "metal");
++  LOG(WARNING) << "Metal runtime not enabled, return a source-only metal module "
++               << "(serializable for a Metal-enabled runtime)...";
++  auto n = ffi::make_object<MetalSourceOnlyModuleNode>(std::move(smap), fmap, std::move(fmt),
++                                                       std::move(source));
++  return ffi::Module(n);
+ }
+ 
+ }  // namespace runtime
