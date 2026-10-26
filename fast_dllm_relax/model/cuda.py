@@ -1059,140 +1059,141 @@ class FastDLLMRelaxForCausalLM(nn.Module):
         )
 
     def get_default_spec(self):
-        return nn.spec.ModuleSpec.from_raw(
-            {
-                "embed": {
-                    "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_hidden": {
-                    "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
-                    "attention_bias": nn.spec.Tensor(
-                        [1, self.num_attention_heads, "seq_len", "seq_len"], "float32"
-                    ),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "get_logits": {
-                    "hidden_states": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "build_prefix_cache": {
-                    "prefix_embed": nn.spec.Tensor([1, "prefix_len", self.hidden_size], self.dtype),
-                    "prefix_bias": nn.spec.Tensor(
-                        [1, self.num_attention_heads, "prefix_len", "prefix_len"], "float32"
-                    ),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_cached": {
-                    "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
-                    "cached_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "cached_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "cache_offset": nn.spec.Tensor([], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_cached_block": {
-                    "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
-                    "cached_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "cached_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "cache_offset": nn.spec.Tensor([], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_block_partial_rp0": {
-                    "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                    "prefix_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "prefix_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "cache_offset": nn.spec.Tensor([], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_block_partial_rp8": {
-                    "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                    "prefix_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "prefix_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "cache_offset": nn.spec.Tensor([], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_block_partial_rp16": {
-                    "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                    "prefix_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "prefix_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "cache_offset": nn.spec.Tensor([], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
-                "forward_block_partial_rp24": {
-                    "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                    "prefix_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "prefix_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_k": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "block_v": nn.spec.Tensor(
-                        [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                        self.dtype,
-                    ),
-                    "cache_offset": nn.spec.Tensor([], "int32"),
-                    "$": {"param_mode": "packed", "effect_mode": "none"},
-                },
+        return nn.spec.ModuleSpec.from_raw(self._default_spec_raw(), self)
+
+    def _default_spec_raw(self) -> dict:
+        """Raw spec dict for get_default_spec (split out so subclasses can add entries)."""
+        return {
+            "embed": {
+                "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
             },
-            self,
-        )
+            "forward_hidden": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "attention_bias": nn.spec.Tensor(
+                    [1, self.num_attention_heads, "seq_len", "seq_len"], "float32"
+                ),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "get_logits": {
+                "hidden_states": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "build_prefix_cache": {
+                "prefix_embed": nn.spec.Tensor([1, "prefix_len", self.hidden_size], self.dtype),
+                "prefix_bias": nn.spec.Tensor(
+                    [1, self.num_attention_heads, "prefix_len", "prefix_len"], "float32"
+                ),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "forward_cached": {
+                "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
+                "cached_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "cached_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "cache_offset": nn.spec.Tensor([], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "forward_cached_block": {
+                "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
+                "cached_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "cached_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "cache_offset": nn.spec.Tensor([], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "forward_block_partial_rp0": {
+                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
+                "prefix_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "prefix_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "block_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "block_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "cache_offset": nn.spec.Tensor([], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "forward_block_partial_rp8": {
+                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
+                "prefix_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "prefix_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "block_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "block_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "cache_offset": nn.spec.Tensor([], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "forward_block_partial_rp16": {
+                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
+                "prefix_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "prefix_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "block_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "block_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "cache_offset": nn.spec.Tensor([], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+            "forward_block_partial_rp24": {
+                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
+                "prefix_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "prefix_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                    self.dtype,
+                ),
+                "block_k": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "block_v": nn.spec.Tensor(
+                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
+                    self.dtype,
+                ),
+                "cache_offset": nn.spec.Tensor([], "int32"),
+                "$": {"param_mode": "packed", "effect_mode": "none"},
+            },
+        }

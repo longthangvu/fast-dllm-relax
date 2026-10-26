@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run ON THE MAC: link a cross-compiled Metal artifact and check it loads.
+"""Run ON THE MAC: link an exported Metal artifact and check it loads.
 
-scripts/export_metal.py ships `fast_dllm_relax_nn.tar` (Mach-O arm64 host objects + devc.o
-carrying MSL source). This untars it, links `fast_dllm_relax_nn.so` with the local toolchain
-(Xcode Command Line Tools clang), then loads it on tvm.device("metal", 0) and resolves all ten
-exported VM functions. Shader compile errors only surface at first kernel launch -- run a
+scripts/export_metal.py (on the workstation or the Mac) writes `fast_dllm_relax_nn.tar` (Mach-O
+arm64 host objects + devc.o carrying MSL source). This untars it, links `fast_dllm_relax_nn.so`
+with the local toolchain (Xcode Command Line Tools clang), then loads it on tvm.device("metal", 0),
+resolves all ten required VM functions and reports the optional static-shape ones. Shader compile errors only surface at first kernel launch -- run a
 `python -m fast_dllm_relax.cli --backend relax --device metal:0 ...` smoke run afterwards.
 
 Usage (Mac, repo root, TVM env from `scripts/setup_tvm.sh mac`):
@@ -27,6 +27,9 @@ REQUIRED_FNS = (
     "forward_block_partial_rp0", "forward_block_partial_rp8",
     "forward_block_partial_rp16", "forward_block_partial_rp24",
 )
+# fast_dllm_relax.model.metal.METAL_STATIC_FNS: optional (the runtime falls back to the dynamic
+# functions without them), reported so an artifact exported before they existed is easy to spot.
+STATIC_FNS = ("forward_cached_b32", "forward_cached_block_b32", "get_logits_m8", "get_logits_m32")
 
 
 def main() -> int:
@@ -64,6 +67,16 @@ def main() -> int:
         print(f"MISSING globals: {missing}")
         return 1
     print(f"All {len(REQUIRED_FNS)} required globals present. Link + load OK.")
+    present = []
+    for fn in STATIC_FNS:
+        try:
+            vm[fn]
+            present.append(fn)
+        except Exception:  # noqa: BLE001
+            pass
+    absent = [fn for fn in STATIC_FNS if fn not in present]
+    print(f"Static-shape globals: {len(present)}/{len(STATIC_FNS)} present"
+          + (f" (absent: {absent}; the runtime uses the dynamic functions instead)" if absent else ""))
     return 0
 
 

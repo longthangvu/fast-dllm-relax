@@ -7,6 +7,9 @@ The Metal device code is emitted as MSL *source* (no `tvm_callback_metal_compile
 compiled by the Mac's Metal runtime at module load. The host code is Mach-O arm64 objects packed
 into a `.tar`; the final link to `fast_dllm_relax_nn.so` happens on the Mac
 (`scripts/link_metal.py`) because a Linux workstation has no macOS SDK/ld64.
+
+The same flow also runs natively on the Mac (a USE_METAL=ON build registers no
+`tvm_callback_metal_compile` either), so both hosts produce the same artifact format.
 """
 
 import re
@@ -46,14 +49,28 @@ def metal_target() -> tvm.target.Target:
     return tvm.target.Target(METAL_TARGET_CONFIG, host=METAL_HOST_TARGET_CONFIG)
 
 
+def _find_llvm_config() -> str | None:
+    """llvm-config on PATH, else the one this TVM was built with (USE_LLVM, e.g. Homebrew's on a Mac)."""
+    found = shutil.which("llvm-config")
+    if found is not None:
+        return found
+    use_llvm = str(tvm.support.libinfo().get("USE_LLVM", "")).split()
+    if use_llvm and Path(use_llvm[0]).is_file():
+        return use_llvm[0]
+    return None
+
+
 def check_metal_cross_toolchain() -> None:
     """Fail fast if this TVM/LLVM can't produce Mac Metal artifacts, before any model work runs."""
     missing = [tool for tool in ("file", "strings") if shutil.which(tool) is None]
     if missing:
         raise RuntimeError(f"Missing required tool(s) for the Metal cross-compile: {missing}")
-    llvm_config = shutil.which("llvm-config")
+    llvm_config = _find_llvm_config()
     if llvm_config is None:
-        raise RuntimeError("llvm-config is required to confirm this LLVM build includes AArch64 support.")
+        raise RuntimeError(
+            "llvm-config is required to confirm this LLVM build includes AArch64 support: put it on "
+            "PATH (e.g. /opt/homebrew/opt/llvm/bin on a Mac)."
+        )
     llvm_targets = subprocess.run(
         [llvm_config, "--targets-built"], check=True, text=True, capture_output=True
     ).stdout
@@ -126,6 +143,8 @@ def inspect_metal_tar(tar_path: Path) -> dict:
         tg_bytes[kname] = total
 
     result["num_kernels"] = len(kernels)
+    # 64-bit integer uses in the MSL; 0 for an int32-narrowed build (the caller decides if that's required).
+    result["long_count"] = len(re.findall(r"\bu?long\d?\b", devc))
     result["max_buffer_index"] = max(max_buffer.values()) if max_buffer else -1
     result["max_threadgroup_bytes"] = max(tg_bytes.values()) if tg_bytes else 0
     over_buf = {k: v for k, v in max_buffer.items() if v > _MAX_BUFFER_INDEX}

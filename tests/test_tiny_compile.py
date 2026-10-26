@@ -3,7 +3,7 @@
     pytest tests/          # with the TVM env from scripts/setup_tvm.sh
 
 CUDA tests are skipped without a CUDA device; the Metal cross-compile test is skipped when this
-TVM build has no Metal codegen.
+TVM build has no Metal codegen. The static-vs-dynamic test runs on CUDA or Metal, whichever exists.
 """
 
 import functools
@@ -15,7 +15,7 @@ from tvm import relax
 
 from fast_dllm_relax.export_utils import REQUIRED_FNS, check_byoc_offload
 from fast_dllm_relax.model.cuda import FastDLLMRelaxConfig, FastDLLMRelaxForCausalLM
-from fast_dllm_relax.model.metal import FastDLLMRelaxForCausalLMNative
+from fast_dllm_relax.model.metal import METAL_STATIC_FNS, FastDLLMRelaxForCausalLMNative, metal_tir_pipeline
 
 _has_cuda = tvm.cuda(0).exist
 _has_metal_codegen = tvm.get_global_func("target.build.metal", allow_missing=True) is not None
@@ -72,6 +72,9 @@ def test_exported_functions_and_param_lists_match(tied):
     for mod in (mod_c, mod_n):
         names = {gv.name_hint for gv in mod.get_global_vars()}
         assert set(REQUIRED_FNS) <= names
+    # Static-shape variants are Metal-only; the CUDA artifact keeps exactly the dynamic set.
+    assert set(METAL_STATIC_FNS) <= {gv.name_hint for gv in mod_n.get_global_vars()}
+    assert not set(METAL_STATIC_FNS) & {gv.name_hint for gv in mod_c.get_global_vars()}
     # Same names/order/shapes, so one params.npz layout serves both models.
     sig = lambda named: [(n, [int(d) for d in p.shape], str(p.dtype)) for n, p in named]  # noqa: E731
     assert sig(named_c) == sig(named_n)
@@ -88,11 +91,83 @@ def test_native_model_has_no_attention_callback():
 
 
 @pytest.mark.skipif(not _has_metal_codegen, reason="TVM built without Metal codegen")
-def test_metal_cross_compile():
-    from fast_dllm_relax.targets.metal import metal_target
+@pytest.mark.parametrize("narrow_i32", [False, True])
+def test_metal_cross_compile(narrow_i32, tmp_path):
+    from fast_dllm_relax.targets.metal import inspect_metal_tar, metal_target
 
     mod_n, _ = _export(FastDLLMRelaxForCausalLMNative, "float16", tied=True)
-    tvm.compile(mod_n, metal_target(), relax_pipeline=relax.get_pipeline("opt_fast_dllm_llm_native"))
+    ex = tvm.compile(
+        mod_n,
+        metal_target(),
+        relax_pipeline=relax.get_pipeline("opt_fast_dllm_llm_native"),
+        tir_pipeline=metal_tir_pipeline(narrow_i32),
+    )
+    ex.export_library(str(tmp_path / "tiny.tar"))
+    info = inspect_metal_tar(tmp_path / "tiny.tar")
+    if narrow_i32:
+        assert info["long_count"] == 0
+    else:
+        assert info["long_count"] > 0  # symbolic-shape kernels index in int64 without narrowing
+
+
+def _static_test_device():
+    if _has_cuda:
+        return tvm.cuda(0)
+    if tvm.metal(0).exist:
+        return tvm.metal(0)
+    return None
+
+
+@pytest.mark.skipif(_static_test_device() is None, reason="no CUDA or Metal device")
+def test_static_variants_match_dynamic():
+    """Each static-shape function computes what its dynamic sibling computes, at the static size.
+
+    Runs on whichever GPU is present, with the Metal pipeline (int32-narrowed on Metal, as exported).
+    """
+    cfg = tiny_config(tied=True)
+    dev = _static_test_device()
+    on_metal = dev.dlpack_device_type() == tvm.metal(0).dlpack_device_type()
+    if on_metal:
+        from fast_dllm_relax.targets.metal import metal_target
+
+        target = metal_target()
+    else:
+        target = tvm.target.Target.from_device(dev)
+    mod_n, named = _export(FastDLLMRelaxForCausalLMNative, "float16", tied=True)
+    ex = tvm.compile(
+        mod_n,
+        target,
+        relax_pipeline=relax.get_pipeline("opt_fast_dllm_llm_native"),
+        tir_pipeline=metal_tir_pipeline(on_metal),
+    )
+    vm = relax.VirtualMachine(ex, dev)
+    params = [tvm.runtime.tensor(a, device=dev) for a in _random_params(named).values()]
+
+    NL, NKV, HD, HS = cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size
+    PLEN, BSIZ, SBS = 64, cfg.bd_size, cfg.bd_size // 4
+    rng = np.random.default_rng(3)
+    t = lambda shape: tvm.runtime.tensor(rng.standard_normal(shape).astype("float16"), dev)  # noqa: E731
+    active = t((1, BSIZ, HS))
+    ck, cv = t((NL, 1, NKV, PLEN, HD)), t((NL, 1, NKV, PLEN, HD))
+    off = tvm.runtime.tensor(np.asarray(PLEN, dtype="int32"), dev)
+
+    pairs = [
+        ("forward_cached_b32", "forward_cached", (active, ck, cv, off)),
+        ("forward_cached_block_b32", "forward_cached_block", (active, ck, cv, off)),
+        ("get_logits_m32", "get_logits", (t((1, BSIZ, HS)),)),
+        ("get_logits_m8", "get_logits", (t((1, SBS, HS)),)),
+    ]
+    as_list = lambda out: [out] if hasattr(out, "numpy") else list(out)  # noqa: E731  tensor or tuple
+    for static, dynamic, args in pairs:
+        outs_s, outs_d = as_list(vm[static](*args, params)), as_list(vm[dynamic](*args, params))
+        assert len(outs_s) == len(outs_d)
+        for a, b in zip(outs_s, outs_d):
+            a, b = a.numpy().astype("float32"), b.numpy().astype("float32")
+            assert a.shape == b.shape and np.isfinite(a).all()
+            if on_metal:  # the shipped configuration: bit-exact (observed on an M4)
+                np.testing.assert_array_equal(a, b, err_msg=f"{static} vs {dynamic}")
+            else:
+                np.testing.assert_allclose(a, b, rtol=5e-3, atol=5e-3, err_msg=f"{static} vs {dynamic}")
 
 
 @needs_cuda

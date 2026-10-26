@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -44,21 +45,24 @@ from .metrics import (
 tvm = None
 relax_greedy_generate = None
 score_masked_continuation = None
+selected_fn_names = None
 
 
 def _ensure_tvm_imported() -> None:
     """Import TVM (and the TVM-dependent Relax runtime) lazily so baseline-only
     usage never requires a compiled TVM library."""
-    global tvm, relax_greedy_generate, score_masked_continuation
+    global tvm, relax_greedy_generate, score_masked_continuation, selected_fn_names
     if tvm is not None:
         return
     import tvm as _tvm
     from .runtime import relax_greedy_generate as _relax_greedy_generate
     from .runtime import score_masked_continuation as _score_masked_continuation
+    from .runtime import selected_fn_names as _selected_fn_names
 
     tvm = _tvm
     relax_greedy_generate = _relax_greedy_generate
     score_masked_continuation = _score_masked_continuation
+    selected_fn_names = _selected_fn_names
 
 
 def _make_tvm_param(arr, artifact_dtype: str, dev):
@@ -556,6 +560,8 @@ class FastDLLMRelaxRunner(ResultRecorder):
         # of rebuilding it from scratch each time. See score_masked_continuation's
         # `cached_prefix` parameter.
         self._loglikelihood_prefix_cache: tuple[list[int], Any] | None = None
+        # Total-length cap from the artifact manifest (int32-indexed Metal artifacts); None = no cap.
+        self.max_total_len: int | None = None
 
         if load_model:
             self.load()
@@ -622,6 +628,11 @@ class FastDLLMRelaxRunner(ResultRecorder):
             self._has_block_cache = True
         except Exception:
             self._has_block_cache = False
+        # Metal artifacts built with int32 device indexing record a total-length cap; CUDA/Jetson
+        # artifacts have no manifest, hence no cap.
+        manifest_path = self.artifact_dir / "fast_dllm_relax_nn_metal_manifest.json"
+        if manifest_path.exists():
+            self.max_total_len = json.loads(manifest_path.read_text(encoding="utf-8")).get("max_total_len")
         self.param_names = param_names_path.read_text(encoding="utf-8").splitlines()
         self.params = self._load_params(params_path, self.param_names)
         self.reshape = tvm.get_global_func("vm.builtin.reshape")
@@ -678,6 +689,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
 
         prompt_ids = self._build_prompt_ids(prompt)
         prompt_token_count = len(prompt_ids)
+        self._check_total_len(prompt_token_count + max_new_tokens + effective_kwargs["block_size"], "generate")
 
         self._sync()
         available_before = snapshot_tvm_available_memory(
@@ -756,6 +768,12 @@ class FastDLLMRelaxRunner(ResultRecorder):
                 "temperature": effective_kwargs["temperature"],
                 "use_block_cache": effective_kwargs["use_block_cache"],
                 "chunked_prefill": self.chunked_prefill,
+                **selected_fn_names(
+                    self.vm,
+                    block_size=effective_kwargs["block_size"],
+                    small_block_size=effective_kwargs["small_block_size"],
+                ),
+                "max_total_len": self.max_total_len,
                 "mask_id": self.mask_id,
                 "stop_token": self.stop_token,
                 "prefill_latency_s": prefill_latency_s,
@@ -816,6 +834,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
         context_ids, continuation_ids = _encode_context_continuation(self.tokenizer, context, continuation)
         if not continuation_ids:
             return 0.0, True
+        self._check_total_len(len(context_ids) + len(continuation_ids) + self.block_size, "loglikelihood")
 
         logits, self._loglikelihood_prefix_cache = score_masked_continuation(
             self.vm,
@@ -860,6 +879,12 @@ class FastDLLMRelaxRunner(ResultRecorder):
                 "mask_id": self.mask_id,
                 "stop_token": self.stop_token,
             },
+            "compiled_fns": (
+                selected_fn_names(self.vm, block_size=self.block_size, small_block_size=self.small_block_size)
+                if self.vm is not None
+                else None
+            ),
+            "max_total_len": self.max_total_len,
             "memory_breakdown": compact_optional_metrics(
                 {
                     "estimated_param_bytes": self.estimated_param_bytes,
@@ -886,6 +911,14 @@ class FastDLLMRelaxRunner(ResultRecorder):
             self.artifact_dir / "fast_dllm_relax_nn_params.npz",
             self.artifact_dir / "fast_dllm_relax_nn_param_names.txt",
         )
+
+    def _check_total_len(self, total_len: int, where: str) -> None:
+        if self.max_total_len is not None and total_len > self.max_total_len:
+            raise ValueError(
+                f"{where}: total length {total_len} (prompt + new tokens + block padding) exceeds "
+                f"max_total_len={self.max_total_len} of this artifact, whose Metal kernels index in "
+                "int32 and would overflow silently. Re-export with --no-index-narrow-i32 for longer inputs."
+            )
 
     def _load_params(self, params_path: Path, param_names: list[str]) -> list[Any]:
         dtype_path = self.artifact_dir / "fast_dllm_relax_nn_dtype.txt"

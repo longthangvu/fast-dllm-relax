@@ -9,14 +9,15 @@ Hugging Face reference implementation on nine lm-eval tasks. The repo covers thr
 |---|---|---|---|
 | Desktop NVIDIA GPU (default) | bf16 or fp16, cuBLAS + CUTLASS + dlight | the GPU machine | the GPU machine |
 | Jetson Orin | bf16 or fp16, cuBLAS + dlight (no CUTLASS) | x86_64 workstation (cross-compile) | Jetson Orin |
-| Apple-silicon Mac (Metal) | fp16, dlight only, in-graph attention | x86_64 workstation (cross-compile) | Mac (linked there) |
+| Apple-silicon Mac (Metal) | fp16, dlight only, in-graph attention, int32 kernel indexing | x86_64 workstation (cross-compile), or the Mac | Mac (linked there) |
 
 The compiled model keeps the Fast-dLLM v2 decoding algorithm: 32-token blocks, refined in 8-token
 sub-blocks, with every position above a 0.9 confidence threshold unmasked in parallel. It also
 keeps the prefix KV cache and the per-layer block cache. Compilation produces a Relax VM executable with ten
 entry points (`embed`, `forward_hidden`, `get_logits`, `build_prefix_cache`, `forward_cached`,
-`forward_cached_block`, `forward_block_partial_rp{0,8,16,24}`). A Python driver
-(`fast_dllm_relax/runtime.py`) runs the decoding loop.
+`forward_cached_block`, `forward_block_partial_rp{0,8,16,24}`). Metal artifacts add four static-shape
+variants (`forward_cached_b32`, `forward_cached_block_b32`, `get_logits_m8`, `get_logits_m32`). A Python
+driver (`fast_dllm_relax/runtime.py`) runs the decoding loop.
 
 ## Results
 
@@ -40,7 +41,7 @@ fast_dllm_relax/
 scripts/
   setup_tvm.sh           build the patched TVM
   export_cuda.py         export desktop-GPU / Jetson artifacts
-  export_metal.py        cross-compile the Metal artifact
+  export_metal.py        export the Metal artifact (cross-compile, or natively on the Mac)
   link_metal.py          (on the Mac) link + load-check the Metal artifact
   eval.sh                run one benchmark task
 lm_eval_tasks/           local copies of lm-eval task configs (see "Benchmarks")
@@ -57,7 +58,7 @@ The repo pins TVM to `apache/tvm@a7bfc857b` and adds a small patch
 | `python/tvm/relax/backend/cuda/cublas.py` | cuBLAS pattern rejects batched×batched matmuls, so cuBLAS claims only the 2D-weight projection GEMMs |
 | `python/tvm/contrib/cutlass/{gemm_operation,gen_tensor_op}.py` | CUTLASS codegen fixes (stream lookup, symbolic head_dim) |
 | `src/relax/backend/contrib/codegen_c/codegen_c.h` | emit the `__tvm_ffi_<name>` entry points the new FFI uses to load CUTLASS kernels |
-| `src/arith/iter_affine_map.cc`, `python/tvm/topi/nn/batch_matmul.py` | accept the symbolic `(prefix_len + 32)`-style shapes of the GQA attention matmuls |
+| `src/arith/iter_affine_map.cc`, `python/tvm/topi/nn/batch_matmul.py` | accept the symbolic `(prefix_len + 32)`-style shapes of the GQA attention matmuls and of the stacked-layer KV concat in the static-block cached forwards |
 | `src/target/opt/build_metal_off.cc` | a `USE_METAL=OFF` build serializes Metal modules in the layout the Metal runtime loads (needed to cross-compile for the Mac) |
 | `python/tvm/s_tir/dlight/gpu/matmul.py`, `cmake/modules/CUDA.cmake` | MLC branch fixes: skip software pipelining in dlight GEMM on low-SM GPUs; default CUDA arch list with CUTLASS |
 
@@ -107,7 +108,9 @@ python scripts/export_cuda.py --dtype float16     # -> artifacts/fast_dllm_relax
 # Jetson Orin: cross-compile on the workstation, then copy the directory to the Jetson
 python scripts/export_cuda.py --dtype float16 --target jetson_orin   # -> artifacts/fast_dllm_relax_fp16_jetson_orin/
 
-# Mac: cross-compile on the workstation, copy to the Mac, link there
+# Mac: cross-compile on the workstation and copy the directory to the Mac, or export on the Mac
+# itself (same command; put Homebrew LLVM on PATH: export PATH=/opt/homebrew/opt/llvm/bin:$PATH).
+# Then link on the Mac.
 python scripts/export_metal.py                    # -> artifacts/fast_dllm_relax_fp16_metal/
 python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal   # on the Mac
 ```
@@ -167,9 +170,9 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
 - **Jetson Orin.** The cross-compiled artifacts pass the AArch64 checks. To check on the device:
   `bash scripts/setup_tvm.sh jetson`, copy `artifacts/fast_dllm_relax_fp16_jetson_orin/`, then run
   `LIMIT=5 CHUNKED=1 BACKEND=relax TASK=gsm8k ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_jetson_orin bash scripts/eval.sh`.
-- **Mac.** The cross-compiled Metal artifact passes the Mach-O, MSL and resource-limit checks. Its kernel set matches the
-  artifact the reported Mac numbers were measured with. That artifact predates `forward_cached_block`
-  and the tied `lm_head`, so re-export it with `scripts/export_metal.py` first. To check on the device:
+- **Mac.** The Metal export (int32 kernel indexing, static-shape variants) follows the build the reported
+  Mac numbers were measured with. Artifacts exported before `forward_cached_block` and the tied
+  `lm_head` do not load; re-export them with `scripts/export_metal.py`. To check on the device:
   1. `bash scripts/setup_tvm.sh mac`
   2. `python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
   3. `python -m fast_dllm_relax.cli --backend relax --use-block-cache --device metal:0 --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
@@ -197,6 +200,14 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
   bit-identical.
 - **Mac.** Only the Relax backend has been validated on the Mac. Metal is fp16-only, because bf16
   needs MSL 3.1.
+- **Metal fast path.** Relax shape variables are int64, so by default every symbolic-shape Metal
+  kernel indexes in emulated 64-bit, several times slower than int32. `export_metal.py` narrows
+  device-kernel indexing to int32 (`--no-index-narrow-i32` keeps int64). The int32 indices would
+  overflow past about 13.4k tokens, so such artifacts record `max_total_len = 12288` (prompt +
+  generation + one block of padding) in their manifest, and the runner rejects longer requests. The
+  artifact also carries static-shape variants of the cached forwards (32 rows) and `get_logits`
+  (8 and 32 rows), which the runtime picks automatically. Opt-outs for A/B runs:
+  `FAST_DLLM_DISABLE_B32=1`, `FAST_DLLM_DISABLE_STATIC_LOGITS=1`.
 
 ## Citation
 

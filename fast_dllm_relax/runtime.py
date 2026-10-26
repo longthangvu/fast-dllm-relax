@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math as _math
+import os
 import time
 from typing import Any
 
@@ -69,6 +70,48 @@ def _tvm_to_torch(t: Any) -> torch.Tensor:
     if _is_cuda(t):
         return torch.from_dlpack(t)
     return torch.from_numpy(t.numpy())
+
+
+# Static-shape dispatch. Metal artifacts carry fixed-row siblings of the dynamic functions
+# (`model/metal.py` METAL_STATIC_FNS); with a static row count their GEMMs compile to much faster
+# kernels. A call uses the sibling when the artifact has one for its row count, else the dynamic
+# function, so CUDA/Jetson artifacts (no siblings) are unaffected. The opt-outs are read once per
+# VM and function name; set them before the first call.
+_STATIC_SUFFIX = {"forward_cached": "_b", "forward_cached_block": "_b", "get_logits": "_m"}
+_STATIC_OPT_OUT = {
+    "forward_cached": "FAST_DLLM_DISABLE_B32",
+    "forward_cached_block": "FAST_DLLM_DISABLE_B32",
+    "get_logits": "FAST_DLLM_DISABLE_STATIC_LOGITS",
+}
+_static_fn_cache: dict[tuple[int, str, int], str] = {}
+
+
+def static_fn_name(vm: Any, base: str, rows: int) -> str:
+    """`base` + its static-shape suffix for `rows` (e.g. forward_cached_block_b32, get_logits_m8)
+    when the VM has that function and its opt-out env var is not "1"; otherwise `base`."""
+    key = (id(vm), base, int(rows))
+    name = _static_fn_cache.get(key)
+    if name is None:
+        name = base
+        if os.environ.get(_STATIC_OPT_OUT[base]) != "1":
+            candidate = f"{base}{_STATIC_SUFFIX[base]}{int(rows)}"
+            try:
+                vm[candidate]
+                name = candidate
+            except Exception:  # noqa: BLE001 -- absent from this artifact
+                pass
+        _static_fn_cache[key] = name
+    return name
+
+
+def selected_fn_names(vm: Any, *, block_size: int, small_block_size: int) -> dict[str, str]:
+    """Which compiled function each generation call site dispatches to (for run metrics)."""
+    return {
+        "cached_forward_fn": static_fn_name(vm, "forward_cached_block", block_size),
+        "append_forward_fn": static_fn_name(vm, "forward_cached", block_size),
+        "logits_fn": static_fn_name(vm, "get_logits", block_size),
+        "partial_logits_fn": static_fn_name(vm, "get_logits", small_block_size),
+    }
 
 
 @dataclasses.dataclass
@@ -142,7 +185,7 @@ def build_prefix_cache_from_ids(
                 tvm.runtime.ShapeTuple([1, embedded.shape[0], embedded.shape[1]]),
             )
             cache_offset = tvm.runtime.tensor(np.asarray(start, dtype="int32"), device=dev)
-            _, new_k, new_v = vm["forward_cached"](
+            _, new_k, new_v = vm[static_fn_name(vm, "forward_cached", embedded.shape[1])](
                 embedded, cache.cached_k, cache.cached_v, cache_offset, params
             )
             cache = PrefixCache(cached_k=new_k, cached_v=new_v, prefix_len=start + block_size)
@@ -199,11 +242,11 @@ def score_active_block_cached_fast(
     cache_offset = tvm.runtime.tensor(
         np.asarray(prefix_cache.prefix_len, dtype="int32"), device=dev
     )
-    hidden, new_cached_k, new_cached_v = vm["forward_cached"](
+    hidden, new_cached_k, new_cached_v = vm[static_fn_name(vm, "forward_cached", block_len)](
         embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
     )
 
-    logits_tvm = vm["get_logits"](hidden, params)                    # [1, block_len, vocab]
+    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)  # [1, block_len, vocab]
     logits = _tvm_to_torch(logits_tvm)
     shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
     shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()      # [block_len]
@@ -249,11 +292,11 @@ def score_active_block_refine(
     cache_offset = tvm.runtime.tensor(
         np.asarray(prefix_cache.prefix_len, dtype="int32"), device=dev
     )
-    hidden, block_k, block_v = vm["forward_cached_block"](
+    hidden, block_k, block_v = vm[static_fn_name(vm, "forward_cached_block", len(active_ids))](
         embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
     )
 
-    logits_tvm = vm["get_logits"](hidden, params)                    # [1, block_len, vocab]
+    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)  # [1, block_len, vocab]
     logits = _tvm_to_torch(logits_tvm)
     shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
     shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()      # [block_len]
@@ -311,7 +354,7 @@ def score_active_block_partial_perlayer(
     )
 
     # get_logits + DLPack + PyTorch reductions (same pattern as score_active_block_cached_fast)
-    logits_tvm = vm["get_logits"](hidden, params)
+    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)
     logits = _tvm_to_torch(logits_tvm)                              # [1, sbs, vocab]
     shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
     shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()     # [sbs]
@@ -466,10 +509,10 @@ def score_masked_continuation(
     )
     cache_offset = tvm.runtime.tensor(np.asarray(prefix_cache.prefix_len, dtype="int32"), device=dev)
     # Scoring never commits the extended cache, so use the block-only variant.
-    hidden, _block_k, _block_v = vm["forward_cached_block"](
+    hidden, _block_k, _block_v = vm[static_fn_name(vm, "forward_cached_block", len(active_ids))](
         embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
     )
-    logits_tvm = vm["get_logits"](hidden, params)
+    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)
     logits = _tvm_to_torch(logits_tvm)  # [1, len(active_ids), vocab]
     # Shift-and-realign: the token AT position i is predicted from the logits AT position i-1.
     shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)

@@ -11,9 +11,13 @@ causal=False and no bias.
 
 The module attribute tree is identical to the CUDA model (`model.layers[i].self_attn.*`), so the
 exported parameter names/order -- and therefore `remap_params` and the npz/param_names artifact
-format -- are unchanged. Exported functions are the same ten (`get_default_spec` is inherited).
+format -- are unchanged. Exported functions are the same ten, plus four static-shape variants
+(`METAL_STATIC_FNS`) whose fixed row counts compile to faster Metal kernels.
 
-Build with `scripts/export_metal.py`.
+The module also defines the device-kernel int32 index narrowing (`metal_tir_pipeline`) used for
+Metal builds, with its total-length cap `NARROW_I32_MAX_TOTAL_LEN`.
+
+Build with `scripts/export_metal.py` (on a Linux workstation or on the Mac).
 """
 
 import tvm
@@ -108,6 +112,43 @@ def opt_fast_dllm_llm_native(ext_mods: list[nn.ExternModule] | None = None):
         )(mod)
 
     return pipeline
+
+
+# Total-length cap (prompt + generated + block padding) for artifacts built with narrow_i32: the
+# largest dynamic buffer is the full-sequence softmax [1, 12, L, L], whose flat index passes int32
+# at L = 13,378. 12,288 = 384 blocks of 32 leaves ~8% headroom.
+NARROW_I32_MAX_TOTAL_LEN = 12288
+
+
+@tvm.transform.module_pass(opt_level=0, name="NarrowDeviceIndexToInt32")
+def narrow_device_index_i32(mod: tvm.ir.IRModule, _ctx: tvm.transform.PassContext) -> tvm.ir.IRModule:
+    """ForceNarrowIndexToInt32 on device kernels only.
+
+    Relax shape vars are int64 and the default NarrowDataType(32) never narrows function params, so
+    every symbolic-shape Metal kernel indexes in (emulated) 64-bit -- 3-16x slower than int32.
+    Runs after the s_tir pipeline (post SplitHostDevice/LowerDeviceKernelLaunch): host code keeps
+    int64 shape math, and the runtime converts each int64 scalar arg to the kernel's declared int32
+    from the device FunctionInfo (pack_args.h INT64_TO_INT32). Does not prove bounds: callers must
+    keep total length <= NARROW_I32_MAX_TOTAL_LEN.
+    """
+    funcs = {}
+    for gv, func in mod.functions.items():
+        if isinstance(func, tirx.PrimFunc) and int(func.attrs.get("calling_conv", 0)) == 2:  # kDeviceKernelLaunch
+            func = tirx.transform.ForceNarrowIndexToInt32()(tvm.IRModule({gv: func}))[gv]
+        funcs[gv] = func
+    return tvm.IRModule(funcs, attrs=mod.attrs)
+
+
+def metal_tir_pipeline(narrow_i32: bool):
+    """TIR pipeline for tvm.compile: default s_tir, plus device-kernel int32 narrowing if requested."""
+    if not narrow_i32:
+        return "default"
+    return tvm.transform.Sequential([tvm.tirx.get_tir_pipeline("s_tir"), narrow_device_index_i32])
+
+
+# Static-shape siblings of the dynamic functions, Metal artifacts only. The runtime uses one when
+# the row count matches and the artifact has it, and falls back to the dynamic function otherwise.
+METAL_STATIC_FNS = ("forward_cached_b32", "forward_cached_block_b32", "get_logits_m8", "get_logits_m32")
 
 
 class FastDLLMRelaxAttentionNative(FastDLLMRelaxAttention):
@@ -227,3 +268,47 @@ class FastDLLMRelaxForCausalLMNative(FastDLLMRelaxForCausalLM):
     ):
         super().__init__(cfg, dtype=dtype, fused_qkv=fused_qkv, fused_gate_up=fused_gate_up)
         self.model = FastDLLMRelaxModelNative(cfg, dtype=dtype, fused_qkv=fused_qkv, fused_gate_up=fused_gate_up)
+
+    # Static-M variants. Every decode caller passes exactly bd_size (or bd_size // 4) rows; a static
+    # M lets the projection and lm_head GEMMs compile to int32-indexed Metal kernels, which run
+    # several times faster than the symbolic-M ones. prefix_len stays symbolic.
+
+    def forward_cached_b32(
+        self,
+        active_embed: Tensor,
+        cached_k: Tensor,
+        cached_v: Tensor,
+        cache_offset: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """forward_cached with a static bd_size-row active block (block append, chunked prefill)."""
+        return self.model.forward_cached(active_embed, cached_k, cached_v, cache_offset)
+
+    def forward_cached_block_b32(
+        self,
+        active_embed: Tensor,
+        cached_k: Tensor,
+        cached_v: Tensor,
+        cache_offset: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """forward_cached_block with a static bd_size-row active block (refinement, loglikelihood)."""
+        return self.model.forward_cached_block(active_embed, cached_k, cached_v, cache_offset)
+
+    def get_logits_m8(self, hidden_states: Tensor) -> Tensor:
+        """get_logits for the bd_size // 4-row partial path, static M."""
+        return self.get_logits(hidden_states)
+
+    def get_logits_m32(self, hidden_states: Tensor) -> Tensor:
+        """get_logits for the bd_size-row full-block path, static M."""
+        return self.get_logits(hidden_states)
+
+    def _default_spec_raw(self) -> dict:
+        raw = super()._default_spec_raw()
+        for name, base in (("forward_cached_b32", "forward_cached"), ("forward_cached_block_b32", "forward_cached_block")):
+            spec = dict(raw[base])
+            spec["active_embed"] = nn.spec.Tensor([1, self.bd_size, self.hidden_size], self.dtype)
+            raw[name] = spec
+        for name, rows in (("get_logits_m8", self.bd_size // 4), ("get_logits_m32", self.bd_size)):
+            spec = dict(raw["get_logits"])
+            spec["hidden_states"] = nn.spec.Tensor([1, rows, self.hidden_size], self.dtype)
+            raw[name] = spec
+        return raw

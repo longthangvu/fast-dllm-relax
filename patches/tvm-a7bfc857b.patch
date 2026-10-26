@@ -134,10 +134,29 @@ index 5143238d7..094467241 100644
      if oshape is None:
          assert XB == YB or XB == 1 or YB == 1, "batch dimension doesn't match"
 diff --git a/src/arith/iter_affine_map.cc b/src/arith/iter_affine_map.cc
-index 0e996485a..2e153b540 100644
+index 0e996485a..37a843ee5 100644
 --- a/src/arith/iter_affine_map.cc
 +++ b/src/arith/iter_affine_map.cc
-@@ -2142,6 +2142,14 @@ bool IterMapRewriter::CanProveDivisible(const PrimExpr& lhs, const PrimExpr& rhs
+@@ -2133,6 +2133,18 @@ class IterMapToExprNormalizer : public ExprMutator {
+   Analyzer* analyzer_;
+ };
+ 
++// Flatten a product tree into its constant coefficient and its non-constant factors.
++static void FlattenMulFactors(const PrimExpr& expr, int64_t* coeff, std::vector<PrimExpr>* factors) {
++  if (const auto* mul = expr.as<MulNode>()) {
++    FlattenMulFactors(mul->a, coeff, factors);
++    FlattenMulFactors(mul->b, coeff, factors);
++  } else if (const auto* imm = expr.as<IntImmNode>()) {
++    *coeff *= imm->value;
++  } else {
++    factors->push_back(expr);
++  }
++}
++
+ bool IterMapRewriter::CanProveDivisible(const PrimExpr& lhs, const PrimExpr& rhs) {
+   const auto* clhs = lhs.as<IntImmNode>();
+   const auto* crhs = rhs.as<IntImmNode>();
+@@ -2142,6 +2154,43 @@ bool IterMapRewriter::CanProveDivisible(const PrimExpr& lhs, const PrimExpr& rhs
      return clhs->value % crhs->value == 0;
    }
  
@@ -146,6 +165,35 @@ index 0e996485a..2e153b540 100644
 +  if (const auto* mul = lhs.as<MulNode>()) {
 +    if (analyzer_->CanProveEqual(mul->a, rhs) || analyzer_->CanProveEqual(mul->b, rhs)) {
 +      return true;
++    }
++  }
++
++  // Generalization of the above to product trees: c1 * f1 * ... * fn is divisible by
++  // c2 * g1 * ... * gm if every g matches a distinct f and c2 divides c1. Handles e.g.
++  // 128 * (prefix_len + 32) * (prefix_len + 32) * 128 divisible by 128 * (prefix_len + 32) * 2,
++  // from the stacked-layer KV concat of a static-block cached forward.
++  {
++    int64_t lhs_coeff = 1, rhs_coeff = 1;
++    std::vector<PrimExpr> lhs_factors, rhs_factors;
++    FlattenMulFactors(lhs, &lhs_coeff, &lhs_factors);
++    FlattenMulFactors(rhs, &rhs_coeff, &rhs_factors);
++    if (rhs_coeff != 0 && lhs_coeff % rhs_coeff == 0 && !rhs_factors.empty()) {
++      std::vector<bool> used(lhs_factors.size(), false);
++      bool all_matched = true;
++      for (const PrimExpr& g : rhs_factors) {
++        bool matched = false;
++        for (size_t i = 0; i < lhs_factors.size(); ++i) {
++          if (!used[i] && analyzer_->CanProveEqual(lhs_factors[i], g)) {
++            used[i] = matched = true;
++            break;
++          }
++        }
++        if (!matched) {
++          all_matched = false;
++          break;
++        }
++      }
++      if (all_matched) return true;
 +    }
 +  }
 +
@@ -200,7 +248,7 @@ index 03eb51463..2559a8bac 100644
        // If there are constants, insert the __init_ and the wrapper
        // This segment would be generated in C++ because of the usage
 diff --git a/src/target/opt/build_metal_off.cc b/src/target/opt/build_metal_off.cc
-index 7f544d92f..c1f51fb19 100644
+index 7f544d92f..33ef33425 100644
 --- a/src/target/opt/build_metal_off.cc
 +++ b/src/target/opt/build_metal_off.cc
 @@ -19,18 +19,71 @@
