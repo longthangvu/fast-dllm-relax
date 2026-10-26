@@ -100,12 +100,12 @@ run() {  # $1 lm-eval task list, $2 results dir
   local cmd=(
     accelerate launch -m fast_dllm_relax.lm_eval_harness
     --model "$lm_model"
-    --tasks "$1" "${fewshot[@]}" --batch_size 1
+    --tasks "$1" ${fewshot[@]+"${fewshot[@]}"} --batch_size 1
     --apply_chat_template --fewshot_as_multiturn
-    "${include[@]}" "${unsafe[@]}"
+    ${include[@]+"${include[@]}"} ${unsafe[@]+"${unsafe[@]}"}
     --model_args "model_name=${model},device=${device},${backend_args}${task_args},${common_args},results_dir=$2"
     --output_path "$2/lm_eval_results.json"
-    "${limit_args[@]}" "${extra_args[@]}"
+    ${limit_args[@]+"${limit_args[@]}"} ${extra_args[@]+"${extra_args[@]}"}
   )
   if [ "${DRYRUN:-0}" = "1" ]; then
     printf '%q ' "${cmd[@]}"; echo

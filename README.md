@@ -170,9 +170,15 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
 - **Jetson Orin.** The cross-compiled artifacts pass the AArch64 checks. To check on the device:
   `bash scripts/setup_tvm.sh jetson`, copy `artifacts/fast_dllm_relax_fp16_jetson_orin/`, then run
   `LIMIT=5 CHUNKED=1 BACKEND=relax TASK=gsm8k ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_jetson_orin bash scripts/eval.sh`.
-- **Mac.** The Metal export (int32 kernel indexing, static-shape variants) follows the build the reported
-  Mac numbers were measured with. Artifacts exported before `forward_cached_block` and the tied
-  `lm_head` do not load; re-export them with `scripts/export_metal.py`. To check on the device:
+- **Mac (M4, macOS 26).** Artifact cross-compiled on the workstation (LLVM 18), linked on the Mac:
+  - GSM8K first 200: token-identical to the run behind the reported numbers (accuracy 60.0%, ~47.6 tok/s).
+  - MMLU (5 per subject, 1,140 requests): loglikelihoods bit-identical to the reported run.
+  - A Mac-native export of the same commit has the same weights and equivalent kernels, and is
+    token-identical.
+  - The first run after linking is slower while macOS compiles and caches the Metal shaders.
+
+  Artifacts exported before `forward_cached_block` and the tied `lm_head` do not load; re-export
+  them with `scripts/export_metal.py`. To check on the device:
   1. `bash scripts/setup_tvm.sh mac`
   2. `python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
   3. `python -m fast_dllm_relax.cli --backend relax --use-block-cache --device metal:0 --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
