@@ -13,10 +13,10 @@ Hugging Face reference implementation on nine lm-eval tasks. The repo covers thr
 
 The compiled model keeps the Fast-dLLM v2 decoding algorithm: 32-token blocks, refined in 8-token
 sub-blocks, with every position above a 0.9 confidence threshold unmasked in parallel. It also
-keeps the prefix KV cache and the per-layer block cache. Compilation produces a Relax VM executable with nine
+keeps the prefix KV cache and the per-layer block cache. Compilation produces a Relax VM executable with ten
 entry points (`embed`, `forward_hidden`, `get_logits`, `build_prefix_cache`, `forward_cached`,
-`forward_block_partial_rp{0,8,16,24}`). A Python driver (`fast_dllm_relax/runtime.py`) runs the
-decoding loop.
+`forward_cached_block`, `forward_block_partial_rp{0,8,16,24}`). A Python driver
+(`fast_dllm_relax/runtime.py`) runs the decoding loop.
 
 ## Results
 
@@ -161,22 +161,31 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
 ## Validation status
 
 - **Desktop GPU (RTX 4500 Ada, sm_89, CUDA 12.8).** Fresh build of this repo, GSM8K first 200 problems:
-  - bf16: token-identical to the run behind the reported numbers (accuracy 61.0%, ~246 tok/s).
-  - fp16: token-identical to the run behind the reported numbers (accuracy 63.0%, ~247 tok/s).
+  - bf16: token-identical to the run behind the reported numbers (accuracy 61.0%, ~249 tok/s).
+  - fp16: token-identical to the run behind the reported numbers (accuracy 63.0%, ~252 tok/s).
   - The loglikelihood path (MMLU, GPQA) and the HF baseline are identical to the original code.
 - **Jetson Orin.** The cross-compiled artifacts pass the AArch64 checks. To check on the device:
   `bash scripts/setup_tvm.sh jetson`, copy `artifacts/fast_dllm_relax_fp16_jetson_orin/`, then run
   `LIMIT=5 CHUNKED=1 BACKEND=relax TASK=gsm8k ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_jetson_orin bash scripts/eval.sh`.
 - **Mac.** The cross-compiled Metal artifact passes the Mach-O, MSL and resource-limit checks. Its kernel set matches the
-  artifact the reported Mac numbers were measured with. To check on the device:
+  artifact the reported Mac numbers were measured with. That artifact predates `forward_cached_block`
+  and the tied `lm_head`, so re-export it with `scripts/export_metal.py` first. To check on the device:
   1. `bash scripts/setup_tvm.sh mac`
   2. `python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
   3. `python -m fast_dllm_relax.cli --backend relax --use-block-cache --device metal:0 --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
 
 ## Notes
 
+- **Two cached forwards.** `forward_cached` returns the prefix KV cache extended by the active
+  block; the runtime uses it only where that cache is kept (block-append, chunked prefill).
+  Refinement full steps and loglikelihood scoring use `forward_cached_block`, which returns just
+  the block's K/V and skips restacking the whole prefix cache on every step. Artifacts exported
+  before this function existed do not load; re-export them.
+- **Tied output weight.** The checkpoint ties `lm_head` to the token embedding, so `get_logits`
+  multiplies by `embed_tokens.weight` directly and the artifact stores the 151936×1536 matrix
+  once (about 467 MB less disk and device memory than a separate `lm_head` copy).
 - **bf16 attention calls back into PyTorch.** In the CUDA artifacts, cached-path attention
-  (`forward_cached`, `forward_block_partial_*`) is a VM-to-Python packed-function callback:
+  (`forward_cached`, `forward_cached_block`, `forward_block_partial_*`) is a VM-to-Python packed-function callback:
   `flash_attn` if installed, otherwise PyTorch SDPA with `enable_gqa`. PyTorch is therefore a
   runtime dependency, and each layer pays a synchronous host round-trip. The Metal model computes
   attention in-graph instead.

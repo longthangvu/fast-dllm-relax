@@ -3,7 +3,7 @@
 
 scripts/export_metal.py ships `fast_dllm_relax_nn.tar` (Mach-O arm64 host objects + devc.o
 carrying MSL source). This untars it, links `fast_dllm_relax_nn.so` with the local toolchain
-(Xcode Command Line Tools clang), then loads it on tvm.device("metal", 0) and resolves all nine
+(Xcode Command Line Tools clang), then loads it on tvm.device("metal", 0) and resolves all ten
 exported VM functions. Shader compile errors only surface at first kernel launch -- run a
 `python -m fast_dllm_relax.cli --backend relax --device metal:0 ...` smoke run afterwards.
 
@@ -23,7 +23,7 @@ from tvm import relax
 from tvm.contrib import cc
 
 REQUIRED_FNS = (
-    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached",
+    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached", "forward_cached_block",
     "forward_block_partial_rp0", "forward_block_partial_rp8",
     "forward_block_partial_rp16", "forward_block_partial_rp24",
 )

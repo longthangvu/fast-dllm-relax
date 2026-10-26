@@ -11,7 +11,7 @@ causal=False and no bias.
 
 The module attribute tree is identical to the CUDA model (`model.layers[i].self_attn.*`), so the
 exported parameter names/order -- and therefore `remap_params` and the npz/param_names artifact
-format -- are unchanged. Exported functions are the same nine (`get_default_spec` is inherited).
+format -- are unchanged. Exported functions are the same ten (`get_default_spec` is inherited).
 
 Build with `scripts/export_metal.py`.
 """
@@ -146,7 +146,7 @@ class FastDLLMRelaxAttentionNative(FastDLLMRelaxAttention):
         prefix_k: Tensor,
         prefix_v: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Same contract as FastDLLMRelaxAttention.forward_cached, in-graph attention."""
         batch_size, block_len, _ = hidden_states.shape
 
@@ -164,7 +164,7 @@ class FastDLLMRelaxAttentionNative(FastDLLMRelaxAttention):
         full_v = op.concat([prefix_v, active_v], dim=2)
 
         attn_out = self._attend_native(q, full_k, full_v)
-        return self.o_proj(attn_out), full_k, full_v
+        return self.o_proj(attn_out), full_k, full_v, active_k, active_v
 
     def forward_block_partial_perlayer(
         self,

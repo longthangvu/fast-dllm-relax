@@ -261,6 +261,16 @@ def main():
         assert tuple(nbv.shape) == (NL, 1, NKV, BSIZ, HD), f"{fn_name}: bad nbv shape"
         print(f"  {fn_name}: h={tuple(h2.shape)}, nbk={tuple(nbk.shape)}")
 
+    # Smoke test: block-only cached forward (refinement full steps)
+    blk_ids = tvm.runtime.tensor(np.ones(BSIZ, dtype='int32'), dev)
+    blk_emb = reshape(vm['embed'](blk_ids, params), tvm.runtime.ShapeTuple([1, BSIZ, HS]))
+    off_blk = tvm.runtime.tensor(np.asarray(PLEN, dtype='int32'), dev)
+    h3, cbk, cbv = vm['forward_cached_block'](blk_emb, pk, pv, off_blk, params)
+    assert tuple(h3.shape) == (1, BSIZ, HS), "forward_cached_block: bad hidden shape"
+    assert tuple(cbk.shape) == (NL, 1, NKV, BSIZ, HD), "forward_cached_block: bad block_k shape"
+    assert tuple(cbv.shape) == (NL, 1, NKV, BSIZ, HD), "forward_cached_block: bad block_v shape"
+    print(f"  forward_cached_block: h={tuple(h3.shape)}, block_k={tuple(cbk.shape)}")
+
     print(f"\n=== COMPLETE: {dtype} artifact ready ===")
     print(f"  Artifact: {artifact_dir}")
 

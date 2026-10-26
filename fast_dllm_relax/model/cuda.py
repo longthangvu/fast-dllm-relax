@@ -64,7 +64,7 @@ def opt_fast_dllm_llm_cublas(
         # carries into every later generation step even though it is built once per prompt.
         _cublas_hot_fns = [
             "forward_hidden", "get_logits",
-            "forward_cached",
+            "forward_cached", "forward_cached_block",
             "forward_block_partial_rp0", "forward_block_partial_rp8",
             "forward_block_partial_rp16", "forward_block_partial_rp24",
             "build_prefix_cache",
@@ -514,7 +514,7 @@ class FastDLLMRelaxAttention(nn.Module):
         prefix_k: Tensor,
         prefix_v: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Cache-aware attention forward for a single active block.
 
         Queries attend to the full key sequence (prefix + active block).
@@ -531,6 +531,8 @@ class FastDLLMRelaxAttention(nn.Module):
             attn_output: [1, block_len, hidden_size]
             full_k:      [1, num_kv_heads, prefix_len + block_len, head_dim]  (cache to store)
             full_v:      [1, num_kv_heads, prefix_len + block_len, head_dim]
+            active_k:    [1, num_kv_heads, block_len, head_dim]  (the block's own K, = full_k[:, :, prefix_len:])
+            active_v:    [1, num_kv_heads, block_len, head_dim]
         """
         batch_size, block_len, _ = hidden_states.shape
 
@@ -564,7 +566,7 @@ class FastDLLMRelaxAttention(nn.Module):
             "attn_out",
         )
         attn_out = op.reshape(attn_out, (batch_size, block_len, self.num_q_heads * self.head_dim))
-        return self.o_proj(attn_out), full_k, full_v
+        return self.o_proj(attn_out), full_k, full_v, active_k, active_v
 
     def forward_block_partial_perlayer(
         self,
@@ -668,14 +670,14 @@ class FastDLLMRelaxDecoderLayer(nn.Module):
         prefix_k: Tensor,
         prefix_v: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Run layer against prefix cache. Returns (hidden, full_k, full_v)."""
-        attn_out, full_k, full_v = self.self_attn.forward_cached(
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Run layer against prefix cache. Returns (hidden, full_k, full_v, active_k, active_v)."""
+        attn_out, full_k, full_v, active_k, active_v = self.self_attn.forward_cached(
             self.input_layernorm(hidden_states), prefix_k, prefix_v, cache_offset
         )
         hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, full_k, full_v
+        return hidden_states, full_k, full_v, active_k, active_v
 
     def forward_block_partial_perlayer(
         self,
@@ -750,26 +752,21 @@ class FastDLLMRelaxModel(nn.Module):
         cached_v = op.concat(vs, dim=0)
         return cached_k, cached_v
 
-    def forward_cached(
+    def _forward_cached_layers(
         self,
         active_embed: Tensor,
         cached_k: Tensor,
         cached_v: Tensor,
         cache_offset: Tensor,
+        keep: str,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Score the active block against the prefix KV cache.
+        """Shared body of forward_cached / forward_cached_block.
 
-        Args:
-            active_embed: [1, block_len, hidden_size]
-            cached_k:     [num_layers, 1, num_kv_heads, prefix_len, head_dim]
-            cached_v:     [num_layers, 1, num_kv_heads, prefix_len, head_dim]
-            cache_offset: [] int32 scalar  (= prefix_len)
-
-        Returns:
-            hidden:       [1, block_len, hidden_size]  (after final norm)
-            new_cached_k: [num_layers, 1, num_kv_heads, prefix_len + block_len, head_dim]
-            new_cached_v: same shape
+        keep="full":  stack each layer's prefix||active K/V  -> [num_layers, 1, kv_heads, prefix_len + block_len, head_dim]
+        keep="block": stack each layer's active-block K/V   -> [num_layers, 1, kv_heads, block_len, head_dim]
+        The attention itself is identical either way (it always attends over prefix||active).
         """
+        assert keep in ("full", "block"), f"keep must be 'full' or 'block', got {keep!r}"
         hidden_states = active_embed
         new_ks: list[Tensor] = []
         new_vs: list[Tensor] = []
@@ -790,16 +787,57 @@ class FastDLLMRelaxModel(nn.Module):
                 ),
                 f"pv_{i}",
             )
-            hidden_states, full_k_i, full_v_i = layer.forward_cached(
+            hidden_states, full_k_i, full_v_i, active_k_i, active_v_i = layer.forward_cached(
                 hidden_states, prefix_k_i, prefix_v_i, cache_offset
             )
-            # full_k_i: [1, kv_heads, prefix_len + block_len, head_dim]
-            new_ks.append(wrap_nested(rx.op.expand_dims(full_k_i._expr, axis=0), f"nk_{i}"))
-            new_vs.append(wrap_nested(rx.op.expand_dims(full_v_i._expr, axis=0), f"nv_{i}"))
+            k_i, v_i = (full_k_i, full_v_i) if keep == "full" else (active_k_i, active_v_i)
+            new_ks.append(wrap_nested(rx.op.expand_dims(k_i._expr, axis=0), f"nk_{i}"))
+            new_vs.append(wrap_nested(rx.op.expand_dims(v_i._expr, axis=0), f"nv_{i}"))
         hidden_states = self.norm(hidden_states)
-        new_cached_k = op.concat(new_ks, dim=0)
-        new_cached_v = op.concat(new_vs, dim=0)
-        return hidden_states, new_cached_k, new_cached_v
+        new_k = op.concat(new_ks, dim=0)
+        new_v = op.concat(new_vs, dim=0)
+        return hidden_states, new_k, new_v
+
+    def forward_cached(
+        self,
+        active_embed: Tensor,
+        cached_k: Tensor,
+        cached_v: Tensor,
+        cache_offset: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Score the active block against the prefix KV cache.
+
+        Args:
+            active_embed: [1, block_len, hidden_size]
+            cached_k:     [num_layers, 1, num_kv_heads, prefix_len, head_dim]
+            cached_v:     [num_layers, 1, num_kv_heads, prefix_len, head_dim]
+            cache_offset: [] int32 scalar  (= prefix_len)
+
+        Returns:
+            hidden:       [1, block_len, hidden_size]  (after final norm)
+            new_cached_k: [num_layers, 1, num_kv_heads, prefix_len + block_len, head_dim]
+            new_cached_v: same shape
+        """
+        return self._forward_cached_layers(active_embed, cached_k, cached_v, cache_offset, keep="full")
+
+    def forward_cached_block(
+        self,
+        active_embed: Tensor,
+        cached_k: Tensor,
+        cached_v: Tensor,
+        cache_offset: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """forward_cached, but returns only the active block's K/V instead of the extended cache.
+
+        For callers that do not commit the extended cache (refinement full steps, loglikelihood
+        scoring): skips restacking the whole prefix cache across layers.
+
+        Returns:
+            hidden:  [1, block_len, hidden_size]  (after final norm)
+            block_k: [num_layers, 1, num_kv_heads, block_len, head_dim]
+            block_v: same shape
+        """
+        return self._forward_cached_layers(active_embed, cached_k, cached_v, cache_offset, keep="block")
 
     def forward_block_partial_perlayer(
         self,
@@ -892,7 +930,11 @@ class FastDLLMRelaxForCausalLM(nn.Module):
         self.model = FastDLLMRelaxModel(
             cfg, dtype=dtype, fused_qkv=fused_qkv, fused_gate_up=fused_gate_up
         )
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False, dtype=dtype)
+        # Tied checkpoints (Fast-dLLM v2 1.5B) reuse embed_tokens.weight in get_logits instead of
+        # carrying a second copy of the vocab x hidden matrix as an lm_head parameter.
+        self.tie_word_embeddings = cfg.tie_word_embeddings
+        if not self.tie_word_embeddings:
+            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False, dtype=dtype)
         self.hidden_size = cfg.hidden_size
         self.num_attention_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
@@ -913,7 +955,12 @@ class FastDLLMRelaxForCausalLM(nn.Module):
         return self.model.forward_hidden(input_embed, attention_bias)
 
     def get_logits(self, hidden_states: Tensor) -> Tensor:
-        logits = self.lm_head(hidden_states)
+        if self.tie_word_embeddings:
+            # Same IR nn.Linear(bias=False).forward emits (matmul with permuted weight), so the cuBLAS
+            # pattern claims it exactly as it claims an untied lm_head.
+            logits = op.matmul(hidden_states, op.permute_dims(self.model.embed_tokens.weight))
+        else:
+            logits = self.lm_head(hidden_states)
         return logits.astype("float32") if logits.dtype != "float32" else logits
 
     def build_prefix_cache(
@@ -942,6 +989,23 @@ class FastDLLMRelaxForCausalLM(nn.Module):
             new_cached_v: same shape
         """
         return self.model.forward_cached(active_embed, cached_k, cached_v, cache_offset)
+
+    def forward_cached_block(
+        self,
+        active_embed: Tensor,
+        cached_k: Tensor,
+        cached_v: Tensor,
+        cache_offset: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """forward_cached returning only the active block's K/V (for callers that do not commit
+        the extended cache: refinement full steps, loglikelihood scoring).
+
+        Returns:
+            hidden:  [1, block_len, hidden_size]
+            block_k: [num_layers, 1, num_kv_heads, block_len, head_dim]
+            block_v: same shape
+        """
+        return self.model.forward_cached_block(active_embed, cached_k, cached_v, cache_offset)
 
     def _forward_block_partial_perlayer(
         self,
@@ -1020,6 +1084,19 @@ class FastDLLMRelaxForCausalLM(nn.Module):
                     "$": {"param_mode": "packed", "effect_mode": "none"},
                 },
                 "forward_cached": {
+                    "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
+                    "cached_k": nn.spec.Tensor(
+                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                        self.dtype,
+                    ),
+                    "cached_v": nn.spec.Tensor(
+                        [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
+                        self.dtype,
+                    ),
+                    "cache_offset": nn.spec.Tensor([], "int32"),
+                    "$": {"param_mode": "packed", "effect_mode": "none"},
+                },
+                "forward_cached_block": {
                     "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
                     "cached_k": nn.spec.Tensor(
                         [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],

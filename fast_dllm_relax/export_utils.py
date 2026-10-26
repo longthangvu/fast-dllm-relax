@@ -10,7 +10,7 @@ from .hf_generation import load_fast_dllm
 from .model.cuda import FastDLLMRelaxConfig
 
 REQUIRED_FNS = (
-    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached",
+    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached", "forward_cached_block",
     "forward_block_partial_rp0", "forward_block_partial_rp8",
     "forward_block_partial_rp16", "forward_block_partial_rp24",
 )
@@ -85,8 +85,10 @@ def remap_params(state_dict, named_param_dict, relax_config, *, torch_dtype, np_
         ], axis=0)
         mapped[f"{mlp}.down_proj.weight"] = _to_numpy(state_dict[f"{mlp}.down_proj.weight"], torch_dtype, np_dtype)
 
-    # Handle tied embeddings
-    if relax_config.tie_word_embeddings and "lm_head.weight" not in state_dict:
+    # A tied Relax model has no lm_head.weight param (get_logits reuses embed_tokens.weight), so the
+    # loop above already skipped it. An untied model whose checkpoint omits lm_head falls back to
+    # the embedding.
+    if "lm_head.weight" in named_param_dict and "lm_head.weight" not in mapped:
         mapped["lm_head.weight"] = mapped["model.embed_tokens.weight"]
 
     missing = set(named_param_dict) - set(mapped)

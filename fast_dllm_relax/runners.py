@@ -606,14 +606,16 @@ class FastDLLMRelaxRunner(ResultRecorder):
         }
         self.loaded_ex = tvm.runtime.load_module(str(library_path))
         self.vm = tvm.relax.VirtualMachine(self.loaded_ex, self.dev)
-        _CACHE_REQUIRED_GLOBALS = ("build_prefix_cache", "forward_cached", "get_logits")
+        _CACHE_REQUIRED_GLOBALS = (
+            "build_prefix_cache", "forward_cached", "forward_cached_block", "get_logits",
+        )
         for _fn_name in _CACHE_REQUIRED_GLOBALS:
             try:
                 self.vm[_fn_name]
             except Exception:
                 raise RuntimeError(
                     f"Relax artifact is missing cache-aware global '{_fn_name}'. "
-                    "Re-export the artifact with scripts/export_cuda.py."
+                    "Re-export the artifact with scripts/export_cuda.py (or scripts/export_metal.py)."
                 ) from None
         try:
             self.vm["forward_block_partial_rp0"]
@@ -799,8 +801,8 @@ class FastDLLMRelaxRunner(ResultRecorder):
         Same masking design as `FastDLLMBaselineRunner.loglikelihood` (mask
         the whole continuation, one forward pass) built on
         `runtime.score_masked_continuation` (prefix KV cache + one masked
-        `forward_cached` call on the tail block) — no extra compiled function
-        is needed.
+        `forward_cached_block` call on the tail block) — no loglikelihood-specific
+        compiled function is needed.
         """
         self.load()
         assert self.tokenizer is not None

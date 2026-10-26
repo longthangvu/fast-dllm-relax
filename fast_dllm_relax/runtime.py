@@ -17,7 +17,7 @@ from .model.cuda import build_prefix_block_attention_bias, extract_shifted_block
 
 # ── bf16 attention packed function ────────────────────────────────────────────
 # Registered at import time so it's available before any VM is created. The CUDA model's
-# forward_cached / forward_block_partial_rp* call it via
+# forward_cached / forward_cached_block / forward_block_partial_rp* call it via
 # rx.call_pure_packed("fast_dllm.flash_attn_bf16"), once per layer, as a synchronous VM-to-Python
 # callback. Inputs/outputs are BSNH TVM tensors; GQA is handled natively (no K/V repeat).
 _FLASH_SCALE = 1.0 / _math.sqrt(128)  # head_dim=128
@@ -175,7 +175,9 @@ def score_active_block_cached_fast(
     active_ids: list[int],
     prefix_cache: PrefixCache,
 ) -> tuple[np.ndarray, np.ndarray, int, PrefixCache]:
-    """Full active-block scoring: compiled forward_cached + get_logits, PyTorch reductions.
+    """Full active-block scoring that commits the extended cache: compiled forward_cached +
+    get_logits, PyTorch reductions. Used at block-append; refinement steps use
+    `score_active_block_refine`, which skips building the extended cache.
 
     The lm_head GEMM runs in the artifact (get_logits); argmax/softmax/max run in PyTorch on a
     zero-copy DLPack view, which is much faster than TVM's generic reduction kernels for
@@ -216,43 +218,54 @@ def score_active_block_cached_fast(
     return shifted_token_ids, max_probs, block_append_token, new_prefix_cache
 
 
-def extract_block_kv(
-    new_cached_k: Any,
-    new_cached_v: Any,
-    prefix_len: int,
+def score_active_block_refine(
+    vm: Any,
+    params: list[Any],
+    dev: Any,
+    reshape_fn: Any,
+    active_ids: list[int],
+    prefix_cache: PrefixCache,
+    *,
     block_size: int,
     small_block_size: int,
-) -> BlockCache:
-    """Extract the active-block KV from the extended prefix cache returned by forward_cached.
+) -> tuple[np.ndarray, np.ndarray, BlockCache]:
+    """Full active-block refinement step: compiled forward_cached_block + get_logits.
 
-    forward_cached returns new_cached_k of shape
-      [num_layers, 1, num_kv_heads, prefix_len + block_size, head_dim].
-    The block portion is the last block_size positions.
+    Same scoring as `score_active_block_cached_fast`, but for steps that do not commit the
+    extended prefix cache: forward_cached_block returns only the active block's per-layer K/V
+    ([num_layers, 1, num_kv_heads, block_len, head_dim]), which becomes the block cache directly.
 
-    Returns TVM tensors so they can be passed directly to compiled partial-forward
-    functions without an extra DLPack round-trip per call.
+    Returns:
+        shifted_token_ids: [block_len] int64 numpy — token to unmask at each position
+        max_probs:         [block_len] float32 numpy — confidence (threshold-comparable)
+        block_cache:       BlockCache for the partial per-layer forwards that follow
     """
-    if _is_cuda(new_cached_k):
-        ck = torch.from_dlpack(new_cached_k)  # zero-copy CUDA view
-        cv = torch.from_dlpack(new_cached_v)
-        bk_pt = ck[:, :, :, prefix_len : prefix_len + block_size, :].contiguous()
-        bv_pt = cv[:, :, :, prefix_len : prefix_len + block_size, :].contiguous()
-        return BlockCache(
-            block_k=tvm.runtime.from_dlpack(bk_pt),
-            block_v=tvm.runtime.from_dlpack(bv_pt),
-            block_size=block_size,
-            small_block_size=small_block_size,
-        )
-    # Non-CUDA: host-copy slice, then back onto the cache's own device.
-    dev = new_cached_k.device
-    bk_np = np.ascontiguousarray(new_cached_k.numpy()[:, :, :, prefix_len : prefix_len + block_size, :])
-    bv_np = np.ascontiguousarray(new_cached_v.numpy()[:, :, :, prefix_len : prefix_len + block_size, :])
-    return BlockCache(
-        block_k=tvm.runtime.tensor(bk_np, device=dev),
-        block_v=tvm.runtime.tensor(bv_np, device=dev),
+    tokens = tvm.runtime.tensor(np.asarray(active_ids, dtype="int32"), device=dev)
+    embedded = vm["embed"](tokens, params)
+    embedded = reshape_fn(
+        embedded,
+        tvm.runtime.ShapeTuple([1, embedded.shape[0], embedded.shape[1]]),
+    )
+    cache_offset = tvm.runtime.tensor(
+        np.asarray(prefix_cache.prefix_len, dtype="int32"), device=dev
+    )
+    hidden, block_k, block_v = vm["forward_cached_block"](
+        embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
+    )
+
+    logits_tvm = vm["get_logits"](hidden, params)                    # [1, block_len, vocab]
+    logits = _tvm_to_torch(logits_tvm)
+    shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+    shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()      # [block_len]
+    max_probs = shifted.softmax(dim=-1).max(dim=-1).values[0].cpu().numpy()  # [block_len]
+
+    block_cache = BlockCache(
+        block_k=block_k,
+        block_v=block_v,
         block_size=block_size,
         small_block_size=small_block_size,
     )
+    return shifted_token_ids, max_probs, block_cache
 
 
 def score_active_block_partial_perlayer(
@@ -387,7 +400,7 @@ def score_masked_continuation(
 
     A `prefix_ids` longer than one block gets a KV cache for its block-aligned portion
     (`build_prefix_cache_from_ids`), and only the remaining tail (context remainder + masked
-    continuation, padded to `block_size`) is scored via `forward_cached` — the same cached path
+    continuation, padded to `block_size`) is scored via `forward_cached_block` — the same cached path
     generation uses, which keeps MMLU/GPQA's multi-thousand-token 5-shot contexts from
     materializing a dense attention matrix. A prefix no longer than one block falls back to
     `score_sequence_block`.
@@ -452,7 +465,8 @@ def score_masked_continuation(
         tvm.runtime.ShapeTuple([1, embedded.shape[0], embedded.shape[1]]),
     )
     cache_offset = tvm.runtime.tensor(np.asarray(prefix_cache.prefix_len, dtype="int32"), device=dev)
-    hidden, _new_cached_k, _new_cached_v = vm["forward_cached"](
+    # Scoring never commits the extended cache, so use the block-only variant.
+    hidden, _block_k, _block_v = vm["forward_cached_block"](
         embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
     )
     logits_tvm = vm["get_logits"](hidden, params)
@@ -611,24 +625,20 @@ def relax_greedy_generate(
                         )
                     else:
                         # Full block forward: block_size tokens, builds/updates block cache.
-                        shifted_ids, probs_arr, _, new_prefix_cache = score_active_block_cached_fast(
+                        # The prefix cache stays fixed during refinement (it is only extended at
+                        # block-append below), so only the block's K/V is returned.
+                        shifted_ids, probs_arr, new_block_cache = score_active_block_refine(
                             vm,
                             params,
                             dev,
                             reshape_fn,
                             x_t[active_start:],
                             prefix_cache,  # type: ignore[arg-type]
+                            block_size=block_size,
+                            small_block_size=small_block_size,
                         )
                         if use_block_cache:
-                            block_cache = extract_block_kv(
-                                new_prefix_cache.cached_k,
-                                new_prefix_cache.cached_v,
-                                prefix_len=prefix_cache.prefix_len,  # type: ignore[union-attr]
-                                block_size=block_size,
-                                small_block_size=small_block_size,
-                            )
-                        # Do NOT advance prefix_cache here — keep prefix stable during refinement.
-                        # (new_prefix_cache is only committed at block-append below.)
+                            block_cache = new_block_cache
                     block_recomputes += 1
                     if use_partial:
                         partial_recomputes += 1
