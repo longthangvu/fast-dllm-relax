@@ -18,6 +18,7 @@
 #   RESULTS_DIR   output directory              (default results/<backend>/<task>)
 #   MODEL         HF model id                   (default Efficient-Large-Model/Fast_dLLM_v2_1.5B)
 #   DRYRUN=1      print the lm-eval command(s) instead of running them
+#   EXTRA_ARGS    extra lm-eval arguments, word-split (e.g. EXTRA_ARGS=--log_samples)
 #
 # humaneval*/mbpp* EXECUTE MODEL-GENERATED PYTHON on this machine (lm-eval's code_eval with
 # --confirm_run_unsafe_code); run them in a sandbox/container you are comfortable with.
@@ -93,6 +94,7 @@ limit_args=()
 if [ -n "${LIMIT:-}" ]; then
   limit_args=(--limit "$LIMIT")
 fi
+read -r -a extra_args <<< "${EXTRA_ARGS:-}"
 
 run() {  # $1 lm-eval task list, $2 results dir
   local cmd=(
@@ -103,7 +105,7 @@ run() {  # $1 lm-eval task list, $2 results dir
     "${include[@]}" "${unsafe[@]}"
     --model_args "model_name=${model},device=${device},${backend_args}${task_args},${common_args},results_dir=$2"
     --output_path "$2/lm_eval_results.json"
-    "${limit_args[@]}"
+    "${limit_args[@]}" "${extra_args[@]}"
   )
   if [ "${DRYRUN:-0}" = "1" ]; then
     printf '%q ' "${cmd[@]}"; echo
