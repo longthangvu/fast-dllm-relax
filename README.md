@@ -22,7 +22,13 @@ driver (`fast_dllm_relax/runtime.py`) runs the decoding loop.
 ## Results
 
 <!-- FIGURE: accuracy vs. HF baseline across the 9 tasks -->
-<!-- FIGURE: generation throughput (tok/s) on desktop GPU / Jetson Orin / Mac -->
+
+Speedups from compiling Fast-dLLM v2 with Relax, compared with the Hugging Face implementation, on a
+desktop GPU workstation, a Jetson Orin NX and a Mac M4. Labels show the Relax/HF throughput ratio.
+
+![Relax vs. HF throughput: (a) decode tokens/s on seven generation tasks, (b) requests/s on MMLU and GPQA](docs/figures/throughput_speedup.png)
+
+<!-- Vector version: [docs/figures/throughput_speedup.pdf](docs/figures/throughput_speedup.pdf). -->
 
 ## Repository layout
 
