@@ -106,7 +106,7 @@ python scripts/export_cuda.py                     # -> artifacts/fast_dllm_relax
 python scripts/export_cuda.py --dtype float16     # -> artifacts/fast_dllm_relax_fp16/
 
 # Jetson Orin: cross-compile on the workstation, then copy the directory to the Jetson
-python scripts/export_cuda.py --dtype float16 --target jetson_orin   # -> artifacts/fast_dllm_relax_fp16_jetson_orin/
+python scripts/export_cuda.py --target jetson_orin   # -> artifacts/fast_dllm_relax_bf16_jetson_orin/
 
 # Mac: cross-compile on the workstation and copy the directory to the Mac, or export on the Mac
 # itself (same command; put Homebrew LLVM on PATH: export PATH=/opt/homebrew/opt/llvm/bin:$PATH).
@@ -133,7 +133,7 @@ Full benchmark tasks run through lm-eval, one task per call:
 BACKEND=relax TASK=gsm8k bash scripts/eval.sh
 BACKEND=hf    TASK=gsm8k bash scripts/eval.sh
 LIMIT=5 BACKEND=relax TASK=ifeval bash scripts/eval.sh          # smoke run
-BACKEND=relax TASK=gsm8k CHUNKED=1 ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_jetson_orin bash scripts/eval.sh   # Jetson
+BACKEND=relax TASK=gsm8k CHUNKED=1 ARTIFACT_DIR=artifacts/fast_dllm_relax_bf16_jetson_orin bash scripts/eval.sh   # Jetson
 BACKEND=relax TASK=gsm8k DEVICE=metal:0 ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_metal bash scripts/eval.sh  # Mac
 ```
 
@@ -167,9 +167,15 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
   - bf16: token-identical to the run behind the reported numbers (accuracy 61.0%, ~249 tok/s).
   - fp16: token-identical to the run behind the reported numbers (accuracy 63.0%, ~252 tok/s).
   - The loglikelihood path (MMLU, GPQA) and the HF baseline are identical to the original code.
-- **Jetson Orin.** The cross-compiled artifacts pass the AArch64 checks. To check on the device:
-  `bash scripts/setup_tvm.sh jetson`, copy `artifacts/fast_dllm_relax_fp16_jetson_orin/`, then run
-  `LIMIT=5 CHUNKED=1 BACKEND=relax TASK=gsm8k ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_jetson_orin bash scripts/eval.sh`.
+- **Jetson Orin (L4T R36.4, CUDA 12.6, MAXN).** bf16 artifact cross-compiled on the workstation,
+  runtime built on the device, `CHUNKED=1`:
+  - GSM8K first 200: token-identical to the run behind the reported numbers (accuracy 58.5%, ~49.7 tok/s).
+  - MMLU (5 per subject, 1,140 requests): loglikelihoods bit-identical to the reported run.
+
+  To check on the device:
+  1. `bash scripts/setup_tvm.sh jetson`
+  2. copy `artifacts/fast_dllm_relax_bf16_jetson_orin/` from the workstation
+  3. `LIMIT=200 CHUNKED=1 BACKEND=relax TASK=gsm8k ARTIFACT_DIR=artifacts/fast_dllm_relax_bf16_jetson_orin bash scripts/eval.sh`
 - **Mac (M4, macOS 26).** Artifact cross-compiled on the workstation (LLVM 18), linked on the Mac:
   - GSM8K first 200: token-identical to the run behind the reported numbers (accuracy 60.0%, ~47.6 tok/s).
   - MMLU (5 per subject, 1,140 requests): loglikelihoods bit-identical to the reported run.
