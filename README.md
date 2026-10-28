@@ -52,7 +52,11 @@ scripts/
   eval.sh                run one benchmark task
 lm_eval_tasks/           local copies of lm-eval task configs (see "Benchmarks")
 tests/                   tiny-config compile tests (no checkpoint needed)
+docs/notebooks/          numbered walkthrough: eager HF model -> Relax rewrite -> each compiler pass -> runtime
 ```
+
+To see how the model is rewritten, compiled and run, step by step, see the notebooks in
+[docs/notebooks/](docs/notebooks/README.md).
 
 ## Setup
 

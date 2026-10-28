@@ -37,6 +37,8 @@ eval = [
     "nvidia-ml-py",
 ]
 test = ["pytest"]
+# Inspection notebooks under docs/notebooks/.
+docs = ["jupyterlab", "ipykernel", "nbclient", "nbformat", "matplotlib"]
 
 [tool.setuptools.packages.find]
 include = ["fast_dllm_relax*"]

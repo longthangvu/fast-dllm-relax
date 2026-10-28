@@ -15,3 +15,11 @@ venv/
 .venv/
 .offload_fast_dllm/
 logs/
+
+AGENTS.md
+CLAUDE.md
+.codex/
+
+# notebook scratch (full IR dumps, checkpoints)
+docs/notebooks/_dumps/
+docs/notebooks/.ipynb_checkpoints/
