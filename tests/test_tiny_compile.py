@@ -2,24 +2,32 @@
 
     pytest tests/          # with the TVM env from scripts/setup_tvm.sh
 
-CUDA tests are skipped without a CUDA device; the Metal cross-compile test is skipped when this
-TVM build has no Metal codegen. The static-vs-dynamic test runs on CUDA or Metal, whichever exists.
+CUDA tests are skipped without a CUDA device. The Metal-model tests are skipped until the Metal
+model is ported to the in-place KV cache (plan 003); before that, the Metal cross-compile test was
+skipped when this TVM build has no Metal codegen, and the static-vs-dynamic test ran on CUDA or
+Metal, whichever existed.
 """
 
 import functools
 
 import numpy as np
 import pytest
+import torch
 import tvm
 from tvm import relax
 
 from fast_dllm_relax.export_utils import REQUIRED_FNS, check_byoc_offload
-from fast_dllm_relax.model.cuda import FastDLLMRelaxConfig, FastDLLMRelaxForCausalLM
+from fast_dllm_relax.model.cuda import (
+    FastDLLMRelaxConfig,
+    FastDLLMRelaxForCausalLM,
+    build_prefix_block_attention_bias,
+)
 from fast_dllm_relax.model.metal import METAL_STATIC_FNS, FastDLLMRelaxForCausalLMNative, metal_tir_pipeline
 
 _has_cuda = tvm.cuda(0).exist
 _has_metal_codegen = tvm.get_global_func("target.build.metal", allow_missing=True) is not None
 needs_cuda = pytest.mark.skipif(not _has_cuda, reason="no CUDA device")
+metal_not_ported = pytest.mark.skip(reason="Metal model not ported to the in-place KV cache (plan 003)")
 
 
 def tiny_config(tied: bool = False) -> FastDLLMRelaxConfig:
@@ -66,30 +74,39 @@ def _compiled_cublas(tied: bool):
 
 
 @pytest.mark.parametrize("tied", [False, True])
-def test_exported_functions_and_param_lists_match(tied):
+def test_exported_functions_and_param_lists(tied):
     mod_c, named_c = _export(FastDLLMRelaxForCausalLM, "float16", tied=tied)
-    mod_n, named_n = _export(FastDLLMRelaxForCausalLMNative, "float16", tied=tied)
-    for mod in (mod_c, mod_n):
-        names = {gv.name_hint for gv in mod.get_global_vars()}
-        assert set(REQUIRED_FNS) <= names
+    names = {gv.name_hint for gv in mod_c.get_global_vars()}
+    assert set(REQUIRED_FNS) <= names
     # Static-shape variants are Metal-only; the CUDA artifact keeps exactly the dynamic set.
-    assert set(METAL_STATIC_FNS) <= {gv.name_hint for gv in mod_n.get_global_vars()}
-    assert not set(METAL_STATIC_FNS) & {gv.name_hint for gv in mod_c.get_global_vars()}
-    # Same names/order/shapes, so one params.npz layout serves both models.
-    sig = lambda named: [(n, [int(d) for d in p.shape], str(p.dtype)) for n, p in named]  # noqa: E731
-    assert sig(named_c) == sig(named_n)
+    assert not set(METAL_STATIC_FNS) & names
+    assert "forward_cached_block" not in names  # merged into forward_cached (in-place KV cache)
     # A tied model reuses embed_tokens.weight in get_logits instead of carrying lm_head.weight.
     assert ("lm_head.weight" in dict(named_c)) == (not tied)
     assert "model.embed_tokens.weight" in dict(named_c)
 
 
+@metal_not_ported
+@pytest.mark.parametrize("tied", [False, True])
+def test_native_exports_same_functions_and_params(tied):
+    mod_c, named_c = _export(FastDLLMRelaxForCausalLM, "float16", tied=tied)
+    mod_n, named_n = _export(FastDLLMRelaxForCausalLMNative, "float16", tied=tied)
+    assert set(REQUIRED_FNS) <= {gv.name_hint for gv in mod_n.get_global_vars()}
+    assert set(METAL_STATIC_FNS) <= {gv.name_hint for gv in mod_n.get_global_vars()}
+    # Same names/order/shapes, so one params.npz layout serves both models.
+    sig = lambda named: [(n, [int(d) for d in p.shape], str(p.dtype)) for n, p in named]  # noqa: E731
+    assert sig(named_c) == sig(named_n)
+
+
+@metal_not_ported
 def test_native_model_has_no_attention_callback():
     mod_n, _ = _export(FastDLLMRelaxForCausalLMNative, "float16")
     assert "flash_attn" not in mod_n.script()
     mod_c, _ = _export(FastDLLMRelaxForCausalLM, "float16")
-    assert "fast_dllm.flash_attn_bf16" in mod_c.script()
+    assert "fast_dllm.attn_inplace" in mod_c.script()
 
 
+@metal_not_ported
 @pytest.mark.skipif(not _has_metal_codegen, reason="TVM built without Metal codegen")
 @pytest.mark.parametrize("narrow_i32", [False, True])
 def test_metal_cross_compile(narrow_i32, tmp_path):
@@ -118,6 +135,7 @@ def _static_test_device():
     return None
 
 
+@metal_not_ported
 @pytest.mark.skipif(_static_test_device() is None, reason="no CUDA or Metal device")
 def test_static_variants_match_dynamic():
     """Each static-shape function computes what its dynamic sibling computes, at the static size.
@@ -186,28 +204,108 @@ def test_cuda_pipeline_offloads_to_cublas(dtype):
         assert kinds.get("static_library", 0) > 0
 
 
-@needs_cuda
-def test_forward_cached_block_matches_forward_cached():
-    """forward_cached_block's block K/V are exactly the tail of forward_cached's extended cache."""
+def _tiny_cuda_setup(seed: int):
+    """(cfg, dev, vm, params, rand) for the tiny tied fp16 CUDA model; rand(shape) -> fp16 TVM tensor."""
     cfg = tiny_config(tied=True)
     dev = tvm.cuda(0)
     _, vm, named = _compiled_cublas(True)
     params = [tvm.runtime.tensor(a, device=dev) for a in _random_params(named).values()]
+    rng = np.random.default_rng(seed)
+    rand = lambda shape: tvm.runtime.tensor(rng.standard_normal(shape).astype("float16"), dev)  # noqa: E731
+    return cfg, dev, vm, params, rand
 
-    NL, NKV, HD, HS = cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size
-    PLEN, BSIZ = 64, cfg.bd_size
-    rng = np.random.default_rng(1)
-    t = lambda shape: tvm.runtime.tensor(rng.standard_normal(shape).astype("float16"), dev)  # noqa: E731
-    active = t((1, BSIZ, HS))
-    ck, cv = t((NL, 1, NKV, PLEN, HD)), t((NL, 1, NKV, PLEN, HD))
-    off = tvm.runtime.tensor(np.asarray(PLEN, dtype="int32"), dev)
 
-    h_full, full_k, full_v = (r.numpy() for r in vm["forward_cached"](active, ck, cv, off, params))
-    h_blk, blk_k, blk_v = (r.numpy() for r in vm["forward_cached_block"](active, ck, cv, off, params))
-    assert blk_k.shape == (NL, 1, NKV, BSIZ, HD)
-    np.testing.assert_array_equal(h_blk, h_full)
-    np.testing.assert_array_equal(blk_k, full_k[:, :, :, PLEN:, :])
-    np.testing.assert_array_equal(blk_v, full_v[:, :, :, PLEN:, :])
+def _torch_cache(cfg, cap: int, fill: float = 7.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """A sentinel-filled in-place KV cache pair, as torch tensors (zero-copy TVM views via from_dlpack)."""
+    shape = (cfg.num_hidden_layers, 1, cap, cfg.num_key_value_heads, cfg.head_dim)
+    return (torch.full(shape, fill, dtype=torch.float16, device="cuda"),
+            torch.full(shape, fill, dtype=torch.float16, device="cuda"))
+
+
+def _tv(t: torch.Tensor):
+    return tvm.runtime.from_dlpack(t)
+
+
+def _off(dev, v: int):
+    return tvm.runtime.tensor(np.asarray(v, dtype="int32"), dev)
+
+
+def _prefill(vm, params, dev, embed, k, v):
+    plen = int(embed.shape[1])
+    bias = tvm.runtime.tensor(build_prefix_block_attention_bias(0, plen, block_size=32), dev)
+    vm["build_prefix_cache"](embed, bias, _tv(k), _tv(v), params)
+    dev.sync()
+
+
+@needs_cuda
+def test_inplace_cache_write_windows():
+    """Each compiled cache call writes exactly its own row window of the in-place KV cache."""
+    cfg, dev, vm, params, rand = _tiny_cuda_setup(1)
+    HS, BSIZ, SBS, PLEN, CAP = cfg.hidden_size, cfg.bd_size, cfg.bd_size // 4, 32, 96
+    k, v = _torch_cache(cfg, CAP)
+    prefix, block = rand((1, PLEN, HS)), rand((1, BSIZ, HS))
+
+    _prefill(vm, params, dev, prefix, k, v)
+    for c in (k, v):
+        assert not (c[:, :, :PLEN] == 7.0).any(), "build_prefix_cache left prefix rows unwritten"
+        assert (c[:, :, PLEN:] == 7.0).all(), "build_prefix_cache wrote past the prefix"
+
+    k_prefix = k[:, :, :PLEN].clone()
+    h = vm["forward_cached"](block, _tv(k), _tv(v), _off(dev, PLEN), tvm.runtime.ShapeTuple([PLEN]), params)
+    dev.sync()
+    assert tuple(h.shape) == (1, BSIZ, HS)
+    assert torch.equal(k[:, :, :PLEN], k_prefix), "forward_cached modified the committed prefix"
+    assert not (k[:, :, PLEN:PLEN + BSIZ] == 7.0).any(), "forward_cached left block rows unwritten"
+    assert (k[:, :, PLEN + BSIZ:] == 7.0).all(), "forward_cached wrote past the block"
+
+    # The block rows hold the same K as a dense prefill of prefix + block at those rows (layer 0's
+    # K depends only on the row's embedding and position; GEMM shapes differ, so not bit-exact).
+    k_dense, v_dense = _torch_cache(cfg, CAP)
+    _prefill(vm, params, dev, tvm.runtime.tensor(np.concatenate([prefix.numpy(), block.numpy()], axis=1), dev),
+             k_dense, v_dense)
+    torch.testing.assert_close(k[0, :, PLEN:PLEN + BSIZ], k_dense[0, :, PLEN:PLEN + BSIZ], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v[0, :, PLEN:PLEN + BSIZ], v_dense[0, :, PLEN:PLEN + BSIZ], rtol=1e-2, atol=1e-2)
+
+    for rp in (0, 8, 16, 24):
+        window = slice(PLEN + rp, PLEN + rp + SBS)
+        k[:, :, window] = 7.0
+        before = k.clone()
+        vm[f"forward_block_partial_rp{rp}"](
+            rand((1, SBS, HS)), _tv(k), _tv(v), _off(dev, PLEN + rp), tvm.runtime.ShapeTuple([PLEN]), params
+        )
+        dev.sync()
+        outside = torch.ones(CAP, dtype=torch.bool, device="cuda")
+        outside[window] = False
+        assert torch.equal(k[:, :, outside], before[:, :, outside]), f"rp{rp} wrote outside its window"
+        assert not (k[:, :, window] == 7.0).any(), f"rp{rp} left its window unwritten"
+
+
+@needs_cuda
+def test_inplace_matches_dense_reference():
+    """Cached forward == the dense block-causal forward_hidden on the same rows; a partial forward of
+    a sub-block == the full cached step's rows for it (same tokens). Different attention kernels
+    (in-graph fp32 vs the torch callback), hence the fp16 tolerance."""
+    cfg, dev, vm, params, rand = _tiny_cuda_setup(2)
+    HS, BSIZ, SBS, PLEN = cfg.hidden_size, cfg.bd_size, cfg.bd_size // 4, 64
+    seq = rand((1, PLEN + BSIZ, HS)).numpy()
+    bias = tvm.runtime.tensor(build_prefix_block_attention_bias(0, PLEN + BSIZ, block_size=BSIZ), dev)
+    h_dense = vm["forward_hidden"](tvm.runtime.tensor(seq, dev), bias, params).numpy()[:, PLEN:]
+
+    k, v = _torch_cache(cfg, PLEN + BSIZ)
+    _prefill(vm, params, dev, tvm.runtime.tensor(np.ascontiguousarray(seq[:, :PLEN]), dev), k, v)
+    plen = tvm.runtime.ShapeTuple([PLEN])
+    h_cached = vm["forward_cached"](
+        tvm.runtime.tensor(np.ascontiguousarray(seq[:, PLEN:]), dev), _tv(k), _tv(v), _off(dev, PLEN), plen, params
+    ).numpy()
+    np.testing.assert_allclose(h_cached.astype("float32"), h_dense.astype("float32"), rtol=2e-2, atol=2e-2)
+
+    for rp in (0, 8, 16, 24):
+        small = tvm.runtime.tensor(np.ascontiguousarray(seq[:, PLEN + rp:PLEN + rp + SBS]), dev)
+        h_part = vm[f"forward_block_partial_rp{rp}"](small, _tv(k), _tv(v), _off(dev, PLEN + rp), plen, params).numpy()
+        np.testing.assert_allclose(
+            h_part.astype("float32"), h_cached[:, rp:rp + SBS].astype("float32"), rtol=2e-2, atol=2e-2,
+            err_msg=f"rp{rp}",
+        )
 
 
 @needs_cuda
@@ -231,6 +329,7 @@ def test_tied_get_logits_matches_untied():
     )
 
 
+@metal_not_ported
 @needs_cuda
 def test_native_matches_callback_attention_on_cuda():
     """In-graph attention (Metal model) vs the torch-callback attention (CUDA model), same pipeline."""

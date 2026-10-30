@@ -9,15 +9,14 @@ Hugging Face reference implementation on nine lm-eval tasks. The repo covers thr
 |---|---|---|---|
 | Desktop NVIDIA GPU (default) | bf16 or fp16, cuBLAS + CUTLASS + dlight | the GPU machine | the GPU machine |
 | Jetson Orin | bf16 or fp16, cuBLAS + dlight (no CUTLASS) | x86_64 workstation (cross-compile) | Jetson Orin |
-| Apple-silicon Mac (Metal) | fp16, dlight only, in-graph attention, int32 kernel indexing | x86_64 workstation (cross-compile), or the Mac | Mac (linked there) |
+| Apple-silicon Mac (Metal) — **not ported to the in-place KV cache yet** (see Notes) | fp16, dlight only, in-graph attention, int32 kernel indexing | x86_64 workstation (cross-compile), or the Mac | Mac (linked there) |
 
 The compiled model keeps the Fast-dLLM v2 decoding algorithm: 32-token blocks, refined in 8-token
 sub-blocks, with every position above a 0.9 confidence threshold unmasked in parallel. It also
-keeps the prefix KV cache and the per-layer block cache. Compilation produces a Relax VM executable with ten
+keeps the prefix KV cache and the per-layer block cache. Compilation produces a Relax VM executable with nine
 entry points (`embed`, `forward_hidden`, `get_logits`, `build_prefix_cache`, `forward_cached`,
-`forward_cached_block`, `forward_block_partial_rp{0,8,16,24}`). Metal artifacts add four static-shape
-variants (`forward_cached_b32`, `forward_cached_block_b32`, `get_logits_m8`, `get_logits_m32`). A Python
-driver (`fast_dllm_relax/runtime.py`) runs the decoding loop.
+`forward_block_partial_rp{0,8,16,24}`). A Python driver (`fast_dllm_relax/runtime.py`) runs the
+decoding loop.
 
 ## Results
 
@@ -193,27 +192,32 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
     token-identical.
   - The first run after linking is slower while macOS compiles and caches the Metal shaders.
 
-  Artifacts exported before `forward_cached_block` and the tied `lm_head` do not load; re-export
-  them with `scripts/export_metal.py`. To check on the device:
+  These results predate the in-place KV cache (plan 003). Until the Metal model is ported,
+  `scripts/export_metal.py` refuses to run and the runner refuses Metal artifacts. The device check was:
   1. `bash scripts/setup_tvm.sh mac`
   2. `python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
   3. `python -m fast_dllm_relax.cli --backend relax --use-block-cache --device metal:0 --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
 
 ## Notes
 
-- **Two cached forwards.** `forward_cached` returns the prefix KV cache extended by the active
-  block; the runtime uses it only where that cache is kept (block-append, chunked prefill).
-  Refinement full steps and loglikelihood scoring use `forward_cached_block`, which returns just
-  the block's K/V and skips restacking the whole prefix cache on every step. Artifacts exported
-  before this function existed do not load; re-export them.
+- **In-place KV cache.** Each sequence gets one preallocated cache, `[layers, 1, capacity, kv_heads,
+  head_dim]` (BSNH rows), sized for the prompt plus `max_new_tokens`. `build_prefix_cache` writes the
+  prefix rows; `forward_cached` and `forward_block_partial_rp*` write the active rows' K/V in place at
+  the cache frontier and attend over a zero-copy view of rows `[0, prefix_len + block)`. Refinement
+  and scoring never commit those rows; block-append commits them by advancing `prefix_len`. Nothing
+  is sliced, concatenated, transposed or restacked per step. Exports write
+  `fast_dllm_relax_nn_kv_cache.json` (contract name and cache dims); the runner refuses artifacts
+  without it, so artifacts from before this change must be re-exported.
 - **Tied output weight.** The checkpoint ties `lm_head` to the token embedding, so `get_logits`
   multiplies by `embed_tokens.weight` directly and the artifact stores the 151936×1536 matrix
   once (about 467 MB less disk and device memory than a separate `lm_head` copy).
-- **bf16 attention calls back into PyTorch.** In the CUDA artifacts, cached-path attention
-  (`forward_cached`, `forward_cached_block`, `forward_block_partial_*`) is a VM-to-Python packed-function callback:
-  `flash_attn` if installed, otherwise PyTorch SDPA with `enable_gqa`. PyTorch is therefore a
-  runtime dependency, and each layer pays a synchronous host round-trip. The Metal model computes
-  attention in-graph instead.
+- **Cached attention calls back into PyTorch.** In the CUDA artifacts, cached-path attention
+  (`forward_cached`, `forward_block_partial_*`) is a VM-to-Python packed-function callback,
+  `fast_dllm.attn_inplace` (a call_inplace_packed): it writes the rows' K/V into the cache, then runs
+  `flash_attn` if installed, otherwise PyTorch SDPA with `enable_gqa`. `build_prefix_cache` writes
+  its rows through `fast_dllm.kv_write`. PyTorch is therefore a runtime dependency, and each layer
+  pays a synchronous host round-trip (≈0.01–0.15 ms per step; research 002). The Metal model computes
+  attention in-graph instead and has not been ported to the in-place cache yet.
 - **Pass order matters.** The CUDA pipeline partitions cuBLAS before CUTLASS. CUTLASS's generic
   dense pattern would otherwise claim the projection GEMMs first, and cuBLAS would silently get
   nothing.

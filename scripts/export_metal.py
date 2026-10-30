@@ -94,7 +94,15 @@ def register_metallib_compiler() -> bool:
     return True
 
 
+_NOT_PORTED = (
+    "The Metal model is not ported to the in-place KV cache yet (plan 003: "
+    ".codex/thoughts/shared/plans/003_inplace_kv_cache_and_q1_fix.md), and the runner no longer "
+    "loads functional-cache artifacts."
+)
+
+
 def main() -> None:
+    raise SystemExit(_NOT_PORTED)
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--revision", default=DEFAULT_MODEL_REVISION,

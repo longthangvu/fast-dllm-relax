@@ -18,6 +18,12 @@ The module also defines the device-kernel int32 index narrowing (`metal_tir_pipe
 Metal builds, with its total-length cap `NARROW_I32_MAX_TOTAL_LEN`.
 
 Build with `scripts/export_metal.py` (on a Linux workstation or on the Mac).
+
+NOT PORTED to the in-place KV cache (plan 003). The CUDA model's cache contract changed: one
+preallocated BSNH cache written in place through the `fast_dllm.attn_inplace` / `fast_dllm.kv_write`
+callbacks. This module still overrides the old functional-cache methods, so it no longer exports;
+`scripts/export_metal.py` refuses to run and the runner refuses Metal artifacts until a port (an
+in-graph row write via call_tir_inplace plus attention over a sliced view) lands.
 """
 
 import tvm

@@ -202,6 +202,13 @@ class PassRecord:
 _WRAPPER_PASSES = ("pipeline", "sequential")
 
 
+def _snapshot(mod):
+    """A new IRModule holding the same functions/attrs, immune to later in-place `mod[gv] = f` edits."""
+    import tvm
+
+    return tvm.IRModule(dict(mod.functions_items()), attrs=mod.attrs, global_infos=mod.global_infos)
+
+
 @functools.cache
 def _recorder_cls():
     from tvm.ir.instrument import pass_instrument
@@ -235,7 +242,9 @@ def _recorder_cls():
                 depth=sum(1 for n, _ in self._stack if n not in _WRAPPER_PASSES),
                 seconds=seconds,
                 stats=ir_stats(mod),
-                mod=mod if self.keep_modules else None,
+                # Shallow copy: some passes (dlight ApplyDefaultSchedule) rewrite functions into the
+                # IRModule object they were given, which would otherwise alter this record afterwards.
+                mod=_snapshot(mod) if self.keep_modules else None,
             )
             self.records.append(rec)
             if self.dump_dir is not None:
@@ -441,7 +450,7 @@ def list_functions(mod, *, pattern: str | None = None) -> None:
 
 
 _ENTRY_POINTS = {
-    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached", "forward_cached_block",
+    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached",
     "forward_block_partial_rp0", "forward_block_partial_rp8", "forward_block_partial_rp16",
     "forward_block_partial_rp24",
 }
@@ -697,7 +706,7 @@ def hf_to_relax_params(named, hf_module, dev, *, prefix: str = "") -> list[Any]:
 # Entry names the production CUDA pipeline partitions for cuBLAS (`_cublas_hot_fns` in
 # model/cuda.py). FuseOpsByPattern looks each one up by name, so a module must define all of them.
 _CUBLAS_HOT_FNS = (
-    "forward_hidden", "get_logits", "forward_cached", "forward_cached_block",
+    "forward_hidden", "get_logits", "forward_cached",
     "forward_block_partial_rp0", "forward_block_partial_rp8", "forward_block_partial_rp16",
     "forward_block_partial_rp24", "build_prefix_cache",
 )
@@ -890,6 +899,7 @@ def relax_traced_generate(runner, prompt_ids: list[int], *, max_new_tokens: int,
     from fast_dllm_relax.common import release_relax_memory_pool
 
     vm, params, dev, reshape = runner.vm, runner.params, runner.dev, runner.reshape
+    spec = runner.cache_spec
     bs, sbs = runner.block_size, runner.small_block_size
     thr = runner.threshold if threshold is None else threshold
     mask_id, stop = runner.mask_id, runner.stop_token
@@ -897,6 +907,7 @@ def relax_traced_generate(runner, prompt_ids: list[int], *, max_new_tokens: int,
 
     generated = list(prompt_ids)
     plen0 = len(generated)
+    capacity = -(-(plen0 + max_new_tokens) // bs) * bs + bs  # as relax_greedy_generate sizes it
     prefix_cache = None
     events: list[dict] = []
     step = 0
@@ -912,16 +923,34 @@ def relax_traced_generate(runner, prompt_ids: list[int], *, max_new_tokens: int,
         first = next((i for i, t in enumerate(raw) if t == mask_id), len(raw))
         return raw[:first]
 
+    if plen0 % bs == 0 and max_new_tokens > 0:
+        # Block-aligned prompt: prefill all but its last block, then forward_cached on that block
+        # commits it and predicts the first token (relax_greedy_generate's block-append-after-prefill).
+        prefix_cache = rt.build_prefix_cache_from_ids(
+            vm, params, dev, reshape, generated[:plen0 - bs], num_attention_heads=nh, block_size=bs,
+            cache_spec=spec, capacity=capacity)
+        events.append({"step": step, "kind": "prefill", "fn": "build_prefix_cache",
+                       "tokens_in": plen0 - bs, "cache_len": prefix_cache.prefix_len})
+        step += 1
+        _, _, nxt, prefix_cache = rt.score_active_block_cached_fast(
+            vm, params, dev, reshape, generated[plen0 - bs:], prefix_cache)
+        generated.append(nxt)
+        events.append({"step": step, "kind": "append", "fn": rt.static_fn_name(vm, "forward_cached", bs),
+                       "tokens_in": bs, "cache_len": prefix_cache.prefix_len, "new_token": nxt})
+        step += 1
+        if stop is not None and nxt == int(stop):
+            return cont(generated), events
+
     while len(generated) - plen0 < max_new_tokens:
         plen = len(generated)
-        pad = bs - plen % bs or bs
+        pad = bs - plen % bs
         x_t = generated + [mask_id] * pad
         a0 = len(x_t) - bs
         use_cache = a0 != 0
         if use_cache and (prefix_cache is None or prefix_cache.prefix_len != a0):
             prefix_cache = rt.build_prefix_cache_from_ids(
-                vm, params, dev, reshape, x_t[:a0], num_attention_heads=nh, block_size=bs)
-            release_relax_memory_pool()
+                vm, params, dev, reshape, x_t[:a0], num_attention_heads=nh, block_size=bs,
+                cache_spec=spec, capacity=capacity)
             events.append({"step": step, "kind": "prefill", "fn": "build_prefix_cache",
                            "tokens_in": a0, "cache_len": prefix_cache.prefix_len})
             step += 1
@@ -934,10 +963,9 @@ def relax_traced_generate(runner, prompt_ids: list[int], *, max_new_tokens: int,
                 if stop_done(x_t, plen):
                     return cont(x_t), events
                 if use_cache:
-                    ids_arr, probs, _bc = rt.score_active_block_refine(
-                        vm, params, dev, reshape, x_t[a0:], prefix_cache, block_size=bs, small_block_size=sbs)
+                    ids_arr, probs = rt.score_active_block_refine(vm, params, dev, reshape, x_t[a0:], prefix_cache)
                     blk_ids, blk_p = ids_arr[s0:s1], probs[s0:s1]
-                    fn = rt.static_fn_name(vm, "forward_cached_block", bs)
+                    fn = rt.static_fn_name(vm, "forward_cached", bs)
                     gated = None
                 else:
                     _, shifted = rt.score_sequence_block(
@@ -978,7 +1006,6 @@ def relax_traced_generate(runner, prompt_ids: list[int], *, max_new_tokens: int,
         if use_cache:
             _, _, nxt, prefix_cache = rt.score_active_block_cached_fast(
                 vm, params, dev, reshape, generated[a0:], prefix_cache)
-            release_relax_memory_pool()
             fn = rt.static_fn_name(vm, "forward_cached", bs)
         else:
             cur, _ = rt.score_sequence_block(vm, params, dev, reshape, generated, num_attention_heads=nh, block_size=bs)

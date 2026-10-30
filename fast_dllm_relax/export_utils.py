@@ -1,6 +1,7 @@
 """Shared helpers for the artifact export scripts (scripts/export_cuda.py, scripts/export_metal.py)."""
 
 import collections
+import json
 
 import numpy as np
 import torch
@@ -10,10 +11,27 @@ from .hf_generation import load_fast_dllm
 from .model.cuda import FastDLLMRelaxConfig
 
 REQUIRED_FNS = (
-    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached", "forward_cached_block",
+    "embed", "forward_hidden", "get_logits", "build_prefix_cache", "forward_cached",
     "forward_block_partial_rp0", "forward_block_partial_rp8",
     "forward_block_partial_rp16", "forward_block_partial_rp24",
 )
+
+# KV-cache contract of the exported functions. The runner refuses artifacts whose manifest does not
+# name this contract (older artifacts took and returned a functional, stacked BHSD cache).
+KV_CACHE_CONTRACT = "inplace_bsnh_v1"
+KV_CACHE_MANIFEST = "fast_dllm_relax_nn_kv_cache.json"
+
+
+def write_kv_cache_manifest(artifact_dir, relax_config: "FastDLLMRelaxConfig", dtype: str) -> None:
+    """Record the KV-cache contract and the cache dims the runtime allocates with."""
+    manifest = {
+        "kv_cache": KV_CACHE_CONTRACT,
+        "num_layers": relax_config.num_hidden_layers,
+        "num_kv_heads": relax_config.num_key_value_heads,
+        "head_dim": relax_config.head_dim,
+        "dtype": dtype,
+    }
+    (artifact_dir / KV_CACHE_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 def make_relax_config(hf_config) -> FastDLLMRelaxConfig:

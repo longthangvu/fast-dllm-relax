@@ -47,9 +47,10 @@ from fast_dllm_relax.export_utils import (  # noqa: E402
     make_relax_config,
     make_tvm_param,
     remap_params,
+    write_kv_cache_manifest,
 )
 from fast_dllm_relax.model.cuda import FastDLLMRelaxForCausalLM  # noqa: E402
-import fast_dllm_relax.runtime  # noqa: E402,F401  registers the fast_dllm.flash_attn_bf16 packed fn
+import fast_dllm_relax.runtime  # noqa: E402,F401  registers the fast_dllm.attn_inplace / kv_write packed fns
 
 _ARTIFACT_DIR_BY_DTYPE = {
     "bfloat16": REPO_ROOT / "artifacts" / "fast_dllm_relax_bf16",
@@ -164,6 +165,7 @@ def main():
         "\n".join(named_param_dict) + "\n", encoding="utf-8"
     )
     (artifact_dir / "fast_dllm_relax_nn_dtype.txt").write_text(dtype + "\n", encoding="utf-8")
+    write_kv_cache_manifest(artifact_dir, relax_config, dtype)
     print(f"  Saved: {so_path}")
 
     if args.target == "jetson_orin":
@@ -236,40 +238,54 @@ def main():
         vm[fn]
     print("  All required globals present")
 
-    # Smoke test: per-layer partial forward (all 4 replace_position variants)
+    # Smoke test: the in-place KV cache. Each call may write only its own row window; every other
+    # cache row must keep its sentinel / previous value.
     NL = relax_config.num_hidden_layers
-    NKV = relax_config.num_key_value_heads
-    HD = relax_config.head_dim
-    SBS = 8; PLEN = 32; BSIZ = 32
     HS = relax_config.hidden_size
+    SBS = 8; PLEN = 32; BSIZ = 32; CAP = 96
     reshape = tvm.get_global_func("vm.builtin.reshape")
+    from fast_dllm_relax.model.cuda import build_prefix_block_attention_bias  # noqa: PLC0415
+    from fast_dllm_relax.runtime import CacheSpec, allocate_prefix_cache  # noqa: PLC0415
 
-    tok_ids = tvm.runtime.tensor(np.ones(SBS, dtype='int32'), dev)
-    emb = vm['embed'](tok_ids, params)
-    emb_r = reshape(emb, tvm.runtime.ShapeTuple([1, SBS, HS]))
-    pk = tvm.runtime.empty((NL, 1, NKV, PLEN, HD), dtype, dev)
-    pv = tvm.runtime.empty((NL, 1, NKV, PLEN, HD), dtype, dev)
-    bk = tvm.runtime.empty((NL, 1, NKV, BSIZ, HD), dtype, dev)
-    bv = tvm.runtime.empty((NL, 1, NKV, BSIZ, HD), dtype, dev)
+    def embed(n):
+        ids = tvm.runtime.tensor(np.ones(n, dtype='int32'), dev)
+        return reshape(vm['embed'](ids, params), tvm.runtime.ShapeTuple([1, n, HS]))
+
+    spec = CacheSpec(NL, relax_config.num_key_value_heads, relax_config.head_dim, dtype)
+    cache = allocate_prefix_cache(spec, dev, CAP)
+    k_t = torch.from_dlpack(cache.k)
+    k_t.fill_(7.0)
+    bias = tvm.runtime.tensor(build_prefix_block_attention_bias(0, PLEN, block_size=BSIZ), dev)
+    vm['build_prefix_cache'](embed(PLEN), bias, cache.k, cache.v, params)
+    dev.sync()
+    assert not (k_t[:, :, :PLEN] == 7.0).all(), "build_prefix_cache: rows [0, P) not written"
+    assert (k_t[:, :, PLEN:] == 7.0).all(), "build_prefix_cache: wrote past prefix_len"
+    print(f"  build_prefix_cache: wrote rows [0, {PLEN}) of a cap={CAP} cache")
+
+    plen_arg = tvm.runtime.ShapeTuple([PLEN])
+    off_blk = tvm.runtime.tensor(np.asarray(PLEN, dtype='int32'), dev)
+    prefix_before = k_t[:, :, :PLEN].clone()
+    h = vm['forward_cached'](embed(BSIZ), cache.k, cache.v, off_blk, plen_arg, params)
+    dev.sync()
+    assert tuple(h.shape) == (1, BSIZ, HS), "forward_cached: bad hidden shape"
+    assert torch.equal(k_t[:, :, :PLEN], prefix_before), "forward_cached: modified the prefix"
+    assert not (k_t[:, :, PLEN:PLEN + BSIZ] == 7.0).all(), "forward_cached: block rows not written"
+    assert (k_t[:, :, PLEN + BSIZ:] == 7.0).all(), "forward_cached: wrote past the block"
+    print(f"  forward_cached: h={tuple(h.shape)}, wrote rows [{PLEN}, {PLEN + BSIZ})")
+
     for rp in (0, 8, 16, 24):
         fn_name = f"forward_block_partial_rp{rp}"
+        before = k_t.clone()
         off_rp = tvm.runtime.tensor(np.asarray(PLEN + rp, dtype='int32'), dev)
-        h2, nak, nbk, nbv = vm[fn_name](emb_r, pk, pv, bk, bv, off_rp, params)
+        k_t[:, :, PLEN + rp:PLEN + rp + SBS] = 7.0
+        h2 = vm[fn_name](embed(SBS), cache.k, cache.v, off_rp, plen_arg, params)
+        dev.sync()
         assert tuple(h2.shape) == (1, SBS, HS), f"{fn_name}: bad hidden shape"
-        assert tuple(nak.shape) == (NL, 1, NKV, SBS, HD), f"{fn_name}: bad nak shape"
-        assert tuple(nbk.shape) == (NL, 1, NKV, BSIZ, HD), f"{fn_name}: bad nbk shape"
-        assert tuple(nbv.shape) == (NL, 1, NKV, BSIZ, HD), f"{fn_name}: bad nbv shape"
-        print(f"  {fn_name}: h={tuple(h2.shape)}, nbk={tuple(nbk.shape)}")
-
-    # Smoke test: block-only cached forward (refinement full steps)
-    blk_ids = tvm.runtime.tensor(np.ones(BSIZ, dtype='int32'), dev)
-    blk_emb = reshape(vm['embed'](blk_ids, params), tvm.runtime.ShapeTuple([1, BSIZ, HS]))
-    off_blk = tvm.runtime.tensor(np.asarray(PLEN, dtype='int32'), dev)
-    h3, cbk, cbv = vm['forward_cached_block'](blk_emb, pk, pv, off_blk, params)
-    assert tuple(h3.shape) == (1, BSIZ, HS), "forward_cached_block: bad hidden shape"
-    assert tuple(cbk.shape) == (NL, 1, NKV, BSIZ, HD), "forward_cached_block: bad block_k shape"
-    assert tuple(cbv.shape) == (NL, 1, NKV, BSIZ, HD), "forward_cached_block: bad block_v shape"
-    print(f"  forward_cached_block: h={tuple(h3.shape)}, block_k={tuple(cbk.shape)}")
+        outside = torch.ones(k_t.shape[2], dtype=torch.bool, device=k_t.device)
+        outside[PLEN + rp:PLEN + rp + SBS] = False
+        assert torch.equal(k_t[:, :, outside], before[:, :, outside]), f"{fn_name}: wrote outside its window"
+        assert not (k_t[:, :, PLEN + rp:PLEN + rp + SBS] == 7.0).all(), f"{fn_name}: window not written"
+        print(f"  {fn_name}: h={tuple(h2.shape)}, wrote rows [{PLEN + rp}, {PLEN + rp + SBS})")
 
     print(f"\n=== COMPLETE: {dtype} artifact ready ===")
     print(f"  Artifact: {artifact_dir}")

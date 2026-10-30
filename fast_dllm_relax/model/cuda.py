@@ -64,7 +64,7 @@ def opt_fast_dllm_llm_cublas(
         # carries into every later generation step even though it is built once per prompt.
         _cublas_hot_fns = [
             "forward_hidden", "get_logits",
-            "forward_cached", "forward_cached_block",
+            "forward_cached",
             "forward_block_partial_rp0", "forward_block_partial_rp8",
             "forward_block_partial_rp16", "forward_block_partial_rp24",
             "build_prefix_cache",
@@ -98,10 +98,11 @@ def opt_fast_dllm_llm_cublas(
             target_options["cutlass"] = {"sm": 80, "find_first_valid": False, "tmp_dir": _cutlass_tmp}
         mod = rx.transform.RunCodegen(target_options)(mod)  # sm80 kernels also run on sm86/sm89
         import time as _time  # noqa: PLC0415
-        # dlight.gpu.Matmul() hangs on the batched mixed-precision (fp16/bf16 -> fp32) attention
-        # matmuls. With CUTLASS on, CUTLASS consumes those before scheduling, so Matmul() never sees
-        # them; with use_cutlass=False (Jetson) drop Matmul() and let them fall through to
-        # dlight.gpu.Fallback() (slower per kernel, but terminates).
+        # dlight.gpu.Matmul() schedules the batched bf16 -> fp32 prefill attention matmuls, but on
+        # the fp16 -> fp32 QK^T matmul the scheduled kernel never finishes compiling (TIR codegen).
+        # With CUTLASS on, CUTLASS (fp16 only, no bf16) consumes that one before scheduling; with
+        # use_cutlass=False (Jetson) drop Matmul() so the attention matmuls go to
+        # dlight.gpu.GeneralReduction() instead (slower per kernel, but terminates).
         _matmul_rules = [dlight.gpu.Matmul()] if use_cutlass else []
         _passes = [
             ("FuseTransposeMatmul",      rx.transform.FuseTransposeMatmul()),
@@ -147,13 +148,16 @@ def opt_fast_dllm_llm_cublas(
 def build_prefix_block_attention_bias(
     prefix_len: int,
     block_len: int,
-    num_attention_heads: int,
     *,
     block_size: int | None = None,
     dtype: str = "float32",
     blocked_value: float = -1e9,
 ) -> np.ndarray:
-    """Build the Fast-dLLM block-causal attention bias (bidirectional within a block)."""
+    """Build the Fast-dLLM block-causal attention bias (bidirectional within a block).
+
+    Shape [1, 1, T, T] (T = prefix_len + block_len): every head uses the same mask, and the model
+    broadcasts it over heads when adding it to the scores.
+    """
     if prefix_len < 0:
         raise ValueError("prefix_len must be non-negative")
     if block_len <= 0:
@@ -170,12 +174,7 @@ def build_prefix_block_attention_bias(
     allowed = query_blocks >= key_value_blocks
 
     bias_2d = np.where(allowed, 0.0, blocked_value).astype(dtype, copy=False)
-    bias = np.broadcast_to(
-        bias_2d[None, None, :, :],
-        (1, num_attention_heads, total_len, total_len),
-    ).copy()
-
-    return bias
+    return bias_2d[None, None, :, :]
 
 
 def build_cached_attention_bias(
@@ -470,8 +469,8 @@ class FastDLLMRelaxAttention(nn.Module):
 
     def forward_and_collect_kv(self, hidden_states: Tensor, attention_bias: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Same computation as forward() but also returns post-RoPE K/V for prefix caching.
-        Returns (attn_output, k_cache, v_cache) where k_cache/v_cache are
-        [1, num_kv_heads, seq_len, head_dim].
+        Returns (attn_output, k, v) where k/v are [1, seq_len, num_kv_heads, head_dim] (BSNH, the
+        KV cache's row layout).
         """
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -483,10 +482,6 @@ class FastDLLMRelaxAttention(nn.Module):
 
         # Prefix always starts at position 0, so standard RoPE applies.
         q, k = _apply_rotary_pos_emb(q, k, self.rope_theta, self.head_dim, self.dtype)
-
-        # Save post-RoPE K/V in cache layout: [1, num_kv_heads, seq_len, head_dim]
-        k_cache = op.permute_dims(k, axes=[0, 2, 1, 3])
-        v_cache = op.permute_dims(v, axes=[0, 2, 1, 3])
 
         k_rep = _repeat_kv(k, self.num_kv_groups)
         v_rep = _repeat_kv(v, self.num_kv_groups)
@@ -506,133 +501,70 @@ class FastDLLMRelaxAttention(nn.Module):
         attn_out = op.astype(attn_out, self.dtype)
         attn_out = op.permute_dims(attn_out, axes=[0, 2, 1, 3])
         attn_out = op.reshape(attn_out, (batch_size, seq_len, self.num_q_heads * self.head_dim))
-        return self.o_proj(attn_out), k_cache, v_cache
+        return self.o_proj(attn_out), k, v
 
     def forward_cached(
         self,
         hidden_states: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Cache-aware attention forward for a single active block.
+        layer: int,
+        prefix_len,
+        write_rel: int,
+        attend_rel,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Cache-aware attention for the active rows, against the in-place KV cache.
 
-        Queries attend to the full key sequence (prefix + active block).
-        No attention bias is added — valid because the zero-bias invariant holds
-        for any completed-block prefix (prefix_len % block_size == 0).
+        The `fast_dllm.attn_inplace` callback (runtime.py) writes this call's post-RoPE K/V into
+        rows [prefix_len + write_rel, + seq_len) of this layer's cache slice, then attends over rows
+        [0, prefix_len + attend_rel) -- prefix and active block, no bias, no copies. No attention
+        bias is needed because the prefix is block-aligned (the active block sees all of it).
 
         Args:
-            hidden_states: [1, block_len, hidden_size]
-            prefix_k:      [1, num_kv_heads, prefix_len, head_dim]  post-RoPE
-            prefix_v:      [1, num_kv_heads, prefix_len, head_dim]  post-RoPE
-            cache_offset:  [] int32 scalar — absolute position of first active token (= prefix_len)
+            hidden_states: [1, seq_len, hidden_size]
+            k_cache:       [num_layers, 1, cap, num_kv_heads, head_dim]  (BSNH rows, written in place)
+            v_cache:       same shape
+            cache_offset:  [] int32 -- absolute position of the first active row (RoPE)
+            layer:         compile-time layer index
+            prefix_len:    symbolic int -- committed cache rows
+            write_rel:     compile-time row offset of the active rows within the block
+            attend_rel:    rows of the block attended to (seq_len, or bd_size for partial steps)
 
         Returns:
-            attn_output: [1, block_len, hidden_size]
-            full_k:      [1, num_kv_heads, prefix_len + block_len, head_dim]  (cache to store)
-            full_v:      [1, num_kv_heads, prefix_len + block_len, head_dim]
-            active_k:    [1, num_kv_heads, block_len, head_dim]  (the block's own K, = full_k[:, :, prefix_len:])
-            active_v:    [1, num_kv_heads, block_len, head_dim]
+            attn_output: [1, seq_len, hidden_size]
+            k_cache, v_cache: aliases of the inputs (threaded to the next layer, which orders the
+            in-place writes)
         """
-        batch_size, block_len, _ = hidden_states.shape
+        batch_size, seq_len, _ = hidden_states.shape
 
         q, k, v = self._project_qkv(hidden_states)
 
-        q = op.reshape(q, (batch_size, block_len, self.num_q_heads, self.head_dim))
-        k = op.reshape(k, (batch_size, block_len, self.num_kv_heads, self.head_dim))
-        v = op.reshape(v, (batch_size, block_len, self.num_kv_heads, self.head_dim))
+        q = op.reshape(q, (batch_size, seq_len, self.num_q_heads, self.head_dim))
+        k = op.reshape(k, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        v = op.reshape(v, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
 
-        # RoPE at absolute positions [cache_offset, cache_offset + block_len)
+        # RoPE at absolute positions [cache_offset, cache_offset + seq_len)
         q, k = _apply_rotary_pos_emb_with_offset(q, k, cache_offset, self.rope_theta, self.head_dim, self.dtype)
 
-        # Active K/V in cache layout (BHSD): [1, num_kv_heads, block_len, head_dim]
-        active_k = op.permute_dims(k, axes=[0, 2, 1, 3])
-        active_v = op.permute_dims(v, axes=[0, 2, 1, 3])
-
-        # Full K/V cache (BHSD): prefix || active along seq dim (axis=2)
-        full_k = op.concat([prefix_k, active_k], dim=2)  # [1, NKV, prefix_len+block_len, HD]
-        full_v = op.concat([prefix_v, active_v], dim=2)
-
-        # Convert BHSD cache → BSNH for flash_attn; GQA handled natively
-        k_bsnh = op.permute_dims(full_k, axes=[0, 2, 1, 3])
-        v_bsnh = op.permute_dims(full_v, axes=[0, 2, 1, 3])
-        attn_shape = rx.ShapeExpr([batch_size, block_len, self.num_q_heads, self.head_dim])
-        attn_out = wrap_nested(
-            rx.call_pure_packed(
-                "fast_dllm.flash_attn_bf16",
-                q._expr, k_bsnh._expr, v_bsnh._expr,
-                sinfo_args=[rx.TensorStructInfo(shape=attn_shape, dtype=self.dtype)],
+        # BSNH in, BSNH out; GQA handled natively by the attention kernel
+        attn_shape = rx.ShapeExpr([batch_size, seq_len, self.num_q_heads, self.head_dim])
+        k_cache, v_cache, attn_out = wrap_nested(
+            rx.op.call_inplace_packed(
+                "fast_dllm.attn_inplace",
+                q._expr, k._expr, v._expr, k_cache._expr, v_cache._expr,
+                rx.PrimValue(layer), rx.PrimValue(prefix_len), rx.PrimValue(write_rel), rx.PrimValue(attend_rel),
+                inplace_indices=[3, 4, -1],
+                sinfo_args=[
+                    k_cache._expr.struct_info,
+                    v_cache._expr.struct_info,
+                    rx.TensorStructInfo(shape=attn_shape, dtype=self.dtype),
+                ],
             ),
-            "attn_out",
+            "attn_inplace",
         )
-        attn_out = op.reshape(attn_out, (batch_size, block_len, self.num_q_heads * self.head_dim))
-        return self.o_proj(attn_out), full_k, full_v, active_k, active_v
-
-    def forward_block_partial_perlayer(
-        self,
-        hidden_states: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
-        block_k: Tensor,
-        block_v: Tensor,
-        cache_offset: Tensor,
-        replace_position: int,
-        sbs: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Per-layer K/V update partial attention. Matches HF modeling.py:213-219 semantics.
-
-        Splices fresh K/V into block_k at replace_position before this layer's attention,
-        so the corrected K propagates through hidden_states to subsequent layers.
-
-        Args:
-            hidden_states:    [1, sbs, hidden_size]
-            prefix_k:         [1, num_kv_heads, prefix_len, head_dim]
-            prefix_v:         [1, num_kv_heads, prefix_len, head_dim]
-            block_k:          [1, num_kv_heads, block_size, head_dim]  (stale at replace_position)
-            block_v:          [1, num_kv_heads, block_size, head_dim]
-            cache_offset:     [] int32  (= prefix_len + replace_position, absolute RoPE start)
-            replace_position: int  compile-time constant — start index within block
-            sbs:              int  compile-time constant — small_block_size
-
-        Returns:
-            attn_output:      [1, sbs, hidden_size]
-            active_k:         [1, num_kv_heads, sbs, head_dim]  fresh K for this layer
-            active_v:         [1, num_kv_heads, sbs, head_dim]
-            updated_block_k:  [1, num_kv_heads, block_size, head_dim]  block_k with fresh K spliced in
-            updated_block_v:  [1, num_kv_heads, block_size, head_dim]
-        """
-        batch_size, _sbs, _ = hidden_states.shape
-
-        q, k, v = self._project_qkv(hidden_states)
-
-        q = op.reshape(q, (batch_size, _sbs, self.num_q_heads, self.head_dim))
-        k = op.reshape(k, (batch_size, _sbs, self.num_kv_heads, self.head_dim))
-        v = op.reshape(v, (batch_size, _sbs, self.num_kv_heads, self.head_dim))
-
-        q, k = _apply_rotary_pos_emb_with_offset(q, k, cache_offset, self.rope_theta, self.head_dim, self.dtype)
-
-        active_k = op.permute_dims(k, axes=[0, 2, 1, 3])  # [1, kv_heads, sbs, head_dim]
-        active_v = op.permute_dims(v, axes=[0, 2, 1, 3])
-
-        updated_block_k = _splice_window(block_k, active_k, replace_position, sbs, self.block_size)
-        updated_block_v = _splice_window(block_v, active_v, replace_position, sbs, self.block_size)
-
-        full_k = op.concat([prefix_k, updated_block_k], dim=2)
-        full_v = op.concat([prefix_v, updated_block_v], dim=2)
-        # Convert BHSD cache → BSNH for flash_attn; GQA handled natively
-        k_bsnh = op.permute_dims(full_k, axes=[0, 2, 1, 3])
-        v_bsnh = op.permute_dims(full_v, axes=[0, 2, 1, 3])
-        attn_shape = rx.ShapeExpr([batch_size, _sbs, self.num_q_heads, self.head_dim])
-        attn_out = wrap_nested(
-            rx.call_pure_packed(
-                "fast_dllm.flash_attn_bf16",
-                q._expr, k_bsnh._expr, v_bsnh._expr,
-                sinfo_args=[rx.TensorStructInfo(shape=attn_shape, dtype=self.dtype)],
-            ),
-            "attn_out",
-        )
-        attn_out = op.reshape(attn_out, (batch_size, _sbs, self.num_q_heads * self.head_dim))
-        return self.o_proj(attn_out), active_k, active_v, updated_block_k, updated_block_v
+        attn_out = op.reshape(attn_out, (batch_size, seq_len, self.num_q_heads * self.head_dim))
+        return self.o_proj(attn_out), k_cache, v_cache
 
 
 class FastDLLMRelaxDecoderLayer(nn.Module):
@@ -656,48 +588,33 @@ class FastDLLMRelaxDecoderLayer(nn.Module):
     def forward_and_collect_kv(
         self, hidden_states: Tensor, attention_bias: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Run layer and return (hidden, k_cache, v_cache) for prefix caching."""
-        attn_out, k_cache, v_cache = self.self_attn.forward_and_collect_kv(
+        """Run layer and return (hidden, k, v) for prefix caching (k/v BSNH, see the attention's)."""
+        attn_out, k, v = self.self_attn.forward_and_collect_kv(
             self.input_layernorm(hidden_states), attention_bias
         )
         hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, k_cache, v_cache
+        return hidden_states, k, v
 
     def forward_cached(
         self,
         hidden_states: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Run layer against prefix cache. Returns (hidden, full_k, full_v, active_k, active_v)."""
-        attn_out, full_k, full_v, active_k, active_v = self.self_attn.forward_cached(
-            self.input_layernorm(hidden_states), prefix_k, prefix_v, cache_offset
+        layer: int,
+        prefix_len,
+        write_rel: int,
+        attend_rel,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Run layer against the in-place KV cache. Returns (hidden, k_cache, v_cache)."""
+        attn_out, k_cache, v_cache = self.self_attn.forward_cached(
+            self.input_layernorm(hidden_states), k_cache, v_cache, cache_offset,
+            layer, prefix_len, write_rel, attend_rel,
         )
         hidden_states = hidden_states + attn_out
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, full_k, full_v, active_k, active_v
-
-    def forward_block_partial_perlayer(
-        self,
-        hidden_states: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
-        block_k: Tensor,
-        block_v: Tensor,
-        cache_offset: Tensor,
-        replace_position: int,
-        sbs: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Per-layer K/V update partial forward. Returns (hidden, ak, av, updated_bk, updated_bv)."""
-        attn_out, ak, av, ubk, ubv = self.self_attn.forward_block_partial_perlayer(
-            self.input_layernorm(hidden_states),
-            prefix_k, prefix_v, block_k, block_v, cache_offset, replace_position, sbs,
-        )
-        hidden_states = hidden_states + attn_out
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, ak, av, ubk, ubv
+        return hidden_states, k_cache, v_cache
 
 
 class FastDLLMRelaxModel(nn.Module):
@@ -729,199 +646,62 @@ class FastDLLMRelaxModel(nn.Module):
         return self.norm(hidden_states)
 
     def build_prefix_cache(
-        self, prefix_embed: Tensor, prefix_bias: Tensor
+        self, prefix_embed: Tensor, prefix_bias: Tensor, k_cache: Tensor, v_cache: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Run the prefix through all layers and collect per-layer post-RoPE K/V.
+        """Run the prefix through all layers, writing per-layer post-RoPE K/V into cache rows [0, prefix_len).
 
         Args:
             prefix_embed: [1, prefix_len, hidden_size]
-            prefix_bias:  [1, num_q_heads, prefix_len, prefix_len]  standard block-causal bias
+            prefix_bias:  [1, 1, prefix_len, prefix_len]  block-causal bias (broadcast over heads)
+            k_cache:      [num_layers, 1, cap, num_kv_heads, head_dim]  (written in place)
+            v_cache:      same shape
 
         Returns:
-            cached_k: [num_layers, 1, num_kv_heads, prefix_len, head_dim]
-            cached_v: [num_layers, 1, num_kv_heads, prefix_len, head_dim]
+            k_cache, v_cache: aliases of the inputs (returned so the writes stay live)
         """
         hidden_states = prefix_embed
-        ks: list[Tensor] = []
-        vs: list[Tensor] = []
-        for layer in self.layers:
-            hidden_states, k_i, v_i = layer.forward_and_collect_kv(hidden_states, prefix_bias)
-            ks.append(wrap_nested(rx.op.expand_dims(k_i._expr, axis=0), "k_layer"))
-            vs.append(wrap_nested(rx.op.expand_dims(v_i._expr, axis=0), "v_layer"))
-        cached_k = self._stack_layers(ks, "stack_k")
-        cached_v = self._stack_layers(vs, "stack_v")
-        return cached_k, cached_v
-
-    def _stack_layers(self, per_layer: list[Tensor], name: str) -> Tensor:
-        """Concatenate per-layer [1, ...] tensors into [num_layers, ...] (build_prefix_cache).
-        The Metal model overrides this to keep the fused kernel within Metal's buffer limit."""
-        return op.concat(per_layer, dim=0)
-
-    def _forward_cached_layers(
-        self,
-        active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
-        cache_offset: Tensor,
-        keep: str,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Shared body of forward_cached / forward_cached_block.
-
-        keep="full":  stack each layer's prefix||active K/V  -> [num_layers, 1, kv_heads, prefix_len + block_len, head_dim]
-        keep="block": stack each layer's active-block K/V   -> [num_layers, 1, kv_heads, block_len, head_dim]
-        The attention itself is identical either way (it always attends over prefix||active).
-        """
-        assert keep in ("full", "block"), f"keep must be 'full' or 'block', got {keep!r}"
-        hidden_states = active_embed
-        new_ks: list[Tensor] = []
-        new_vs: list[Tensor] = []
         for i, layer in enumerate(self.layers):
-            # Slice per-layer prefix: [num_layers, 1, kv_heads, prefix_len, head_dim]
-            #   -> [1, kv_heads, prefix_len, head_dim]  (take removes the first dim)
-            prefix_k_i = wrap_nested(
-                rx.op.squeeze(
-                    rx.op.strided_slice(cached_k._expr, begin=[i], end=[i + 1], strides=[1], axes=[0]),
-                    axis=[0],
+            hidden_states, k_i, v_i = layer.forward_and_collect_kv(hidden_states, prefix_bias)
+            k_cache, v_cache = wrap_nested(
+                rx.op.call_inplace_packed(
+                    "fast_dllm.kv_write",
+                    k_i._expr, v_i._expr, k_cache._expr, v_cache._expr,
+                    rx.PrimValue(i), rx.PrimValue(0),
+                    inplace_indices=[2, 3],
+                    sinfo_args=[k_cache._expr.struct_info, v_cache._expr.struct_info],
                 ),
-                f"pk_{i}",
+                f"kv_write_{i}",
             )
-            prefix_v_i = wrap_nested(
-                rx.op.squeeze(
-                    rx.op.strided_slice(cached_v._expr, begin=[i], end=[i + 1], strides=[1], axes=[0]),
-                    axis=[0],
-                ),
-                f"pv_{i}",
-            )
-            hidden_states, full_k_i, full_v_i, active_k_i, active_v_i = layer.forward_cached(
-                hidden_states, prefix_k_i, prefix_v_i, cache_offset
-            )
-            k_i, v_i = (full_k_i, full_v_i) if keep == "full" else (active_k_i, active_v_i)
-            new_ks.append(wrap_nested(rx.op.expand_dims(k_i._expr, axis=0), f"nk_{i}"))
-            new_vs.append(wrap_nested(rx.op.expand_dims(v_i._expr, axis=0), f"nv_{i}"))
-        hidden_states = self.norm(hidden_states)
-        new_k = op.concat(new_ks, dim=0)
-        new_v = op.concat(new_vs, dim=0)
-        return hidden_states, new_k, new_v
+        return k_cache, v_cache
 
     def forward_cached(
         self,
         active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Score the active block against the prefix KV cache.
+        prefix_len,
+        write_rel: int = 0,
+        attend_rel=None,
+    ) -> Tensor:
+        """Score active rows against the in-place KV cache (see FastDLLMRelaxAttention.forward_cached).
 
-        Args:
-            active_embed: [1, block_len, hidden_size]
-            cached_k:     [num_layers, 1, num_kv_heads, prefix_len, head_dim]
-            cached_v:     [num_layers, 1, num_kv_heads, prefix_len, head_dim]
-            cache_offset: [] int32 scalar  (= prefix_len)
+        Each layer writes the active rows' K/V at cache rows [prefix_len + write_rel, + seq_len) and
+        attends over rows [0, prefix_len + attend_rel). attend_rel defaults to seq_len (a full block
+        at the cache frontier: block-append, refinement full steps, scoring, chunked prefill); the
+        partial per-layer forwards pass write_rel=replace_position, attend_rel=bd_size.
 
         Returns:
-            hidden:       [1, block_len, hidden_size]  (after final norm)
-            new_cached_k: [num_layers, 1, num_kv_heads, prefix_len + block_len, head_dim]
-            new_cached_v: same shape
+            hidden: [1, seq_len, hidden_size]  (after final norm)
         """
-        return self._forward_cached_layers(active_embed, cached_k, cached_v, cache_offset, keep="full")
-
-    def forward_cached_block(
-        self,
-        active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
-        cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """forward_cached, but returns only the active block's K/V instead of the extended cache.
-
-        For callers that do not commit the extended cache (refinement full steps, loglikelihood
-        scoring): skips restacking the whole prefix cache across layers.
-
-        Returns:
-            hidden:  [1, block_len, hidden_size]  (after final norm)
-            block_k: [num_layers, 1, num_kv_heads, block_len, head_dim]
-            block_v: same shape
-        """
-        return self._forward_cached_layers(active_embed, cached_k, cached_v, cache_offset, keep="block")
-
-    def forward_block_partial_perlayer(
-        self,
-        active_embed: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
-        block_k: Tensor,
-        block_v: Tensor,
-        cache_offset: Tensor,
-        replace_position: int,
-        sbs: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Per-layer K/V update partial forward. Achieves exact HF parity.
-
-        Each layer splices fresh K/V into its own block_k slice at replace_position before
-        attending, so corrected K propagates through hidden_states to subsequent layers.
-
-        Args:
-            active_embed:     [1, sbs, hidden_size]
-            prefix_k:         [num_layers, 1, kv_heads, prefix_len, head_dim]
-            prefix_v:         [num_layers, 1, kv_heads, prefix_len, head_dim]
-            block_k:          [num_layers, 1, kv_heads, block_size, head_dim]  (stale at rp)
-            block_v:          [num_layers, 1, kv_heads, block_size, head_dim]
-            cache_offset:     [] int32  (= prefix_len + replace_position)
-            replace_position: int  compile-time constant
-            sbs:              int  compile-time constant
-
-        Returns:
-            hidden:       [1, sbs, hidden_size]  (after final norm)
-            new_active_k: [num_layers, 1, kv_heads, sbs, head_dim]
-            new_block_k:  [num_layers, 1, kv_heads, block_size, head_dim]  (updated per layer)
-            new_block_v:  [num_layers, 1, kv_heads, block_size, head_dim]
-        """
+        if attend_rel is None:
+            attend_rel = active_embed.shape[1]
         hidden_states = active_embed
-        new_aks: list[Tensor] = []
-        new_bks: list[Tensor] = []
-        new_bvs: list[Tensor] = []
-
         for i, layer in enumerate(self.layers):
-            pk_i = wrap_nested(
-                rx.op.squeeze(
-                    rx.op.strided_slice(prefix_k._expr, begin=[i], end=[i + 1], strides=[1], axes=[0]),
-                    axis=[0],
-                ),
-                f"pk_{i}",
+            hidden_states, k_cache, v_cache = layer.forward_cached(
+                hidden_states, k_cache, v_cache, cache_offset, i, prefix_len, write_rel, attend_rel
             )
-            pv_i = wrap_nested(
-                rx.op.squeeze(
-                    rx.op.strided_slice(prefix_v._expr, begin=[i], end=[i + 1], strides=[1], axes=[0]),
-                    axis=[0],
-                ),
-                f"pv_{i}",
-            )
-            bk_i = wrap_nested(
-                rx.op.squeeze(
-                    rx.op.strided_slice(block_k._expr, begin=[i], end=[i + 1], strides=[1], axes=[0]),
-                    axis=[0],
-                ),
-                f"bk_{i}",
-            )
-            bv_i = wrap_nested(
-                rx.op.squeeze(
-                    rx.op.strided_slice(block_v._expr, begin=[i], end=[i + 1], strides=[1], axes=[0]),
-                    axis=[0],
-                ),
-                f"bv_{i}",
-            )
-            hidden_states, ak_i, _av_i, ubk_i, ubv_i = layer.forward_block_partial_perlayer(
-                hidden_states, pk_i, pv_i, bk_i, bv_i, cache_offset, replace_position, sbs,
-            )
-            new_aks.append(wrap_nested(rx.op.expand_dims(ak_i._expr, axis=0), f"nak_{i}"))
-            new_bks.append(wrap_nested(rx.op.expand_dims(ubk_i._expr, axis=0), f"nbk_{i}"))
-            new_bvs.append(wrap_nested(rx.op.expand_dims(ubv_i._expr, axis=0), f"nbv_{i}"))
-
-        hidden_states = self.norm(hidden_states)
-        new_active_k = op.concat(new_aks, dim=0)
-        new_block_k = op.concat(new_bks, dim=0)
-        new_block_v = op.concat(new_bvs, dim=0)
-        return hidden_states, new_active_k, new_block_k, new_block_v
+        return self.norm(hidden_states)
 
 
 class FastDLLMRelaxForCausalLM(nn.Module):
@@ -969,105 +749,101 @@ class FastDLLMRelaxForCausalLM(nn.Module):
         return logits.astype("float32") if logits.dtype != "float32" else logits
 
     def build_prefix_cache(
-        self, prefix_embed: Tensor, prefix_bias: Tensor
+        self, prefix_embed: Tensor, prefix_bias: Tensor, k_cache: Tensor, v_cache: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Encode completed prefix blocks and return stacked per-layer KV cache.
+        """Encode completed prefix blocks into KV cache rows [0, prefix_len) in place.
 
         Returns:
-            cached_k: [num_layers, 1, num_kv_heads, prefix_len, head_dim]
-            cached_v: same shape
+            k_cache, v_cache: the (written) inputs, [num_layers, 1, cap, num_kv_heads, head_dim]
         """
-        return self.model.build_prefix_cache(prefix_embed, prefix_bias)
+        return self.model.build_prefix_cache(prefix_embed, prefix_bias, k_cache, v_cache)
 
     def forward_cached(
         self,
         active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Score the active block against the prefix KV cache.
+        prefix_len: int,
+    ) -> Tensor:
+        """Score the active block against the prefix KV cache, writing its K/V at rows
+        [prefix_len, prefix_len + block_len) (committed by the caller advancing prefix_len, or
+        overwritten by the next call).
 
         Returns:
-            hidden:       [1, block_len, hidden_size]
-            new_cached_k: [num_layers, 1, num_kv_heads, prefix_len + block_len, head_dim]
-            new_cached_v: same shape
+            hidden: [1, block_len, hidden_size]
         """
-        return self.model.forward_cached(active_embed, cached_k, cached_v, cache_offset)
-
-    def forward_cached_block(
-        self,
-        active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
-        cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """forward_cached returning only the active block's K/V (for callers that do not commit
-        the extended cache: refinement full steps, loglikelihood scoring).
-
-        Returns:
-            hidden:  [1, block_len, hidden_size]
-            block_k: [num_layers, 1, num_kv_heads, block_len, head_dim]
-            block_v: same shape
-        """
-        return self.model.forward_cached_block(active_embed, cached_k, cached_v, cache_offset)
+        return self.model.forward_cached(active_embed, k_cache, v_cache, cache_offset, prefix_len)
 
     def _forward_block_partial_perlayer(
         self,
         active_embed: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
-        block_k: Tensor,
-        block_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
+        prefix_len: int,
         replace_position: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        sbs = self.bd_size // 4
-        return self.model.forward_block_partial_perlayer(
-            active_embed, prefix_k, prefix_v, block_k, block_v, cache_offset, replace_position, sbs,
+    ) -> Tensor:
+        """Partial forward of one small block at replace_position: each layer overwrites the block's
+        rows [replace_position, +sbs) with fresh K/V, then attends over prefix + the whole block (the
+        other block rows keep the last full step's K/V) -- the HF per-layer block-cache update.
+        """
+        return self.model.forward_cached(
+            active_embed, k_cache, v_cache, cache_offset, prefix_len,
+            write_rel=replace_position, attend_rel=self.bd_size,
         )
 
     def forward_block_partial_rp0(
-        self, active_embed: Tensor, prefix_k: Tensor, prefix_v: Tensor,
-        block_k: Tensor, block_v: Tensor, cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        self, active_embed: Tensor, k_cache: Tensor, v_cache: Tensor, cache_offset: Tensor, prefix_len: int,
+    ) -> Tensor:
         """Per-layer partial forward with replace_position=0."""
         return self._forward_block_partial_perlayer(
-            active_embed, prefix_k, prefix_v, block_k, block_v, cache_offset, replace_position=0,
+            active_embed, k_cache, v_cache, cache_offset, prefix_len, replace_position=0,
         )
 
     def forward_block_partial_rp8(
-        self, active_embed: Tensor, prefix_k: Tensor, prefix_v: Tensor,
-        block_k: Tensor, block_v: Tensor, cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        self, active_embed: Tensor, k_cache: Tensor, v_cache: Tensor, cache_offset: Tensor, prefix_len: int,
+    ) -> Tensor:
         """Per-layer partial forward with replace_position=8."""
         return self._forward_block_partial_perlayer(
-            active_embed, prefix_k, prefix_v, block_k, block_v, cache_offset, replace_position=8,
+            active_embed, k_cache, v_cache, cache_offset, prefix_len, replace_position=8,
         )
 
     def forward_block_partial_rp16(
-        self, active_embed: Tensor, prefix_k: Tensor, prefix_v: Tensor,
-        block_k: Tensor, block_v: Tensor, cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        self, active_embed: Tensor, k_cache: Tensor, v_cache: Tensor, cache_offset: Tensor, prefix_len: int,
+    ) -> Tensor:
         """Per-layer partial forward with replace_position=16."""
         return self._forward_block_partial_perlayer(
-            active_embed, prefix_k, prefix_v, block_k, block_v, cache_offset, replace_position=16,
+            active_embed, k_cache, v_cache, cache_offset, prefix_len, replace_position=16,
         )
 
     def forward_block_partial_rp24(
-        self, active_embed: Tensor, prefix_k: Tensor, prefix_v: Tensor,
-        block_k: Tensor, block_v: Tensor, cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        self, active_embed: Tensor, k_cache: Tensor, v_cache: Tensor, cache_offset: Tensor, prefix_len: int,
+    ) -> Tensor:
         """Per-layer partial forward with replace_position=24."""
         return self._forward_block_partial_perlayer(
-            active_embed, prefix_k, prefix_v, block_k, block_v, cache_offset, replace_position=24,
+            active_embed, k_cache, v_cache, cache_offset, prefix_len, replace_position=24,
         )
 
     def get_default_spec(self):
         return nn.spec.ModuleSpec.from_raw(self._default_spec_raw(), self)
 
+    def _kv_cache_spec(self) -> nn.spec.Tensor:
+        """In-place KV cache: [num_layers, 1, cap, num_kv_heads, head_dim], BSNH rows."""
+        return nn.spec.Tensor(
+            [self.num_hidden_layers, 1, "cap", self.num_kv_heads, self.head_dim], self.dtype
+        )
+
     def _default_spec_raw(self) -> dict:
         """Raw spec dict for get_default_spec (split out so subclasses can add entries)."""
+        partial = {
+            "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
+            "k_cache": self._kv_cache_spec(),
+            "v_cache": self._kv_cache_spec(),
+            "cache_offset": nn.spec.Tensor([], "int32"),
+            "prefix_len": nn.spec.Int(),
+            "$": {"param_mode": "packed", "effect_mode": "none"},
+        }
         return {
             "embed": {
                 "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
@@ -1075,9 +851,7 @@ class FastDLLMRelaxForCausalLM(nn.Module):
             },
             "forward_hidden": {
                 "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
-                "attention_bias": nn.spec.Tensor(
-                    [1, self.num_attention_heads, "seq_len", "seq_len"], "float32"
-                ),
+                "attention_bias": nn.spec.Tensor([1, 1, "seq_len", "seq_len"], "float32"),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
             "get_logits": {
@@ -1086,119 +860,21 @@ class FastDLLMRelaxForCausalLM(nn.Module):
             },
             "build_prefix_cache": {
                 "prefix_embed": nn.spec.Tensor([1, "prefix_len", self.hidden_size], self.dtype),
-                "prefix_bias": nn.spec.Tensor(
-                    [1, self.num_attention_heads, "prefix_len", "prefix_len"], "float32"
-                ),
+                "prefix_bias": nn.spec.Tensor([1, 1, "prefix_len", "prefix_len"], "float32"),
+                "k_cache": self._kv_cache_spec(),
+                "v_cache": self._kv_cache_spec(),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
             "forward_cached": {
                 "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
-                "cached_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "cached_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
+                "k_cache": self._kv_cache_spec(),
+                "v_cache": self._kv_cache_spec(),
                 "cache_offset": nn.spec.Tensor([], "int32"),
+                "prefix_len": nn.spec.Int(),
                 "$": {"param_mode": "packed", "effect_mode": "none"},
             },
-            "forward_cached_block": {
-                "active_embed": nn.spec.Tensor([1, "block_len", self.hidden_size], self.dtype),
-                "cached_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "cached_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "cache_offset": nn.spec.Tensor([], "int32"),
-                "$": {"param_mode": "packed", "effect_mode": "none"},
-            },
-            "forward_block_partial_rp0": {
-                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                "prefix_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "prefix_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "block_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "block_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "cache_offset": nn.spec.Tensor([], "int32"),
-                "$": {"param_mode": "packed", "effect_mode": "none"},
-            },
-            "forward_block_partial_rp8": {
-                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                "prefix_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "prefix_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "block_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "block_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "cache_offset": nn.spec.Tensor([], "int32"),
-                "$": {"param_mode": "packed", "effect_mode": "none"},
-            },
-            "forward_block_partial_rp16": {
-                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                "prefix_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "prefix_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "block_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "block_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "cache_offset": nn.spec.Tensor([], "int32"),
-                "$": {"param_mode": "packed", "effect_mode": "none"},
-            },
-            "forward_block_partial_rp24": {
-                "active_embed": nn.spec.Tensor([1, self.bd_size // 4, self.hidden_size], self.dtype),
-                "prefix_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "prefix_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, "prefix_len", self.head_dim],
-                    self.dtype,
-                ),
-                "block_k": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "block_v": nn.spec.Tensor(
-                    [self.num_hidden_layers, 1, self.num_kv_heads, self.bd_size, self.head_dim],
-                    self.dtype,
-                ),
-                "cache_offset": nn.spec.Tensor([], "int32"),
-                "$": {"param_mode": "packed", "effect_mode": "none"},
-            },
+            "forward_block_partial_rp0": dict(partial),
+            "forward_block_partial_rp8": dict(partial),
+            "forward_block_partial_rp16": dict(partial),
+            "forward_block_partial_rp24": dict(partial),
         }

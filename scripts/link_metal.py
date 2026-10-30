@@ -35,7 +35,15 @@ STATIC_FNS = (
 )
 
 
+_NOT_PORTED = (
+    "The Metal model is not ported to the in-place KV cache yet (plan 003: "
+    ".codex/thoughts/shared/plans/003_inplace_kv_cache_and_q1_fix.md), and the runner no longer "
+    "loads functional-cache artifacts."
+)
+
+
 def main() -> int:
+    raise SystemExit(_NOT_PORTED)
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-dir", required=True)
     args = parser.parse_args()

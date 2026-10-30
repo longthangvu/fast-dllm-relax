@@ -550,6 +550,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
         self.params = None
         self.dev = None
         self.reshape = None
+        self.cache_spec = None  # runtime.CacheSpec, from the artifact's kv_cache manifest
         self.param_names: list[str] = []
         self.artifact_file_bytes: dict[str, int] = {}
         self.estimated_param_bytes: int | None = None
@@ -612,8 +613,9 @@ class FastDLLMRelaxRunner(ResultRecorder):
         }
         self.loaded_ex = tvm.runtime.load_module(str(library_path))
         self.vm = tvm.relax.VirtualMachine(self.loaded_ex, self.dev)
+        self.cache_spec = self._load_kv_cache_spec()
         _CACHE_REQUIRED_GLOBALS = (
-            "build_prefix_cache", "forward_cached", "forward_cached_block", "get_logits",
+            "build_prefix_cache", "forward_cached", "get_logits",
         )
         for _fn_name in _CACHE_REQUIRED_GLOBALS:
             try:
@@ -621,7 +623,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
             except Exception:
                 raise RuntimeError(
                     f"Relax artifact is missing cache-aware global '{_fn_name}'. "
-                    "Re-export the artifact with scripts/export_cuda.py (or scripts/export_metal.py)."
+                    "Re-export the artifact with scripts/export_cuda.py."
                 ) from None
         try:
             self.vm["forward_block_partial_rp0"]
@@ -725,6 +727,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
             use_block_cache=effective_block_cache,
             mask_id=int(self.mask_id),
             stop_token=None if self.stop_token is None else int(self.stop_token),
+            cache_spec=self.cache_spec,
             timing=timing,
             chunked_prefill=self.chunked_prefill,
         )
@@ -813,13 +816,34 @@ class FastDLLMRelaxRunner(ResultRecorder):
 
         return result
 
+    def _load_kv_cache_spec(self) -> Any:
+        """KV-cache dims from the artifact's kv_cache manifest; refuses artifacts with another contract."""
+        from .export_utils import KV_CACHE_CONTRACT, KV_CACHE_MANIFEST  # noqa: PLC0415
+        from .runtime import CacheSpec  # noqa: PLC0415
+
+        manifest_path = self.artifact_dir / KV_CACHE_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        if manifest.get("kv_cache") != KV_CACHE_CONTRACT:
+            raise RuntimeError(
+                f"Relax artifact {self.artifact_dir} does not use the in-place KV cache "
+                f"(no {KV_CACHE_MANIFEST} with kv_cache={KV_CACHE_CONTRACT!r}). Re-export it with "
+                "scripts/export_cuda.py; Metal artifacts are not supported until the Metal model is "
+                "ported to the in-place KV cache."
+            )
+        return CacheSpec(
+            num_layers=int(manifest["num_layers"]),
+            num_kv_heads=int(manifest["num_kv_heads"]),
+            head_dim=int(manifest["head_dim"]),
+            dtype=str(manifest["dtype"]),
+        )
+
     def loglikelihood(self, context: str, continuation: str) -> tuple[float, bool]:
         """Diffusion loglikelihood via the Relax backend's `score_masked_continuation`.
 
         Same masking design as `FastDLLMBaselineRunner.loglikelihood` (mask
         the whole continuation, one forward pass) built on
         `runtime.score_masked_continuation` (prefix KV cache + one masked
-        `forward_cached_block` call on the tail block) — no loglikelihood-specific
+        `forward_cached` call on the tail block) — no loglikelihood-specific
         compiled function is needed.
         """
         self.load()
@@ -846,6 +870,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
             num_attention_heads=int(self.hf_config.num_attention_heads),
             block_size=self.block_size,
             mask_id=int(self.mask_id),
+            cache_spec=self.cache_spec,
             eos_token_id=self.tokenizer.eos_token_id,
             cached_prefix=self._loglikelihood_prefix_cache,
             chunked_prefill=self.chunked_prefill,
