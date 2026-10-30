@@ -14,6 +14,7 @@
 #   ARTIFACT_DIR  Relax artifact directory      (default artifacts/fast_dllm_relax_bf16)
 #   DEVICE        cuda:0 | metal:0 | ...        (default cuda:0)
 #   CHUNKED=1     Relax only: chunked prefix-cache prefill (recommended on Jetson)
+#   BLOCK_CACHE=0 generative tasks: disable the per-sub-block partial forwards (default 1)
 #   LIMIT         lm-eval --limit, for smoke runs (default: full dataset)
 #   RESULTS_DIR   output directory              (default results/<backend>/<task>)
 #   MODEL         HF model id                   (default Efficient-Large-Model/Fast_dLLM_v2_1.5B)
@@ -46,7 +47,12 @@ if [ "${CHUNKED:-0}" = "1" ]; then
   backend_args="${backend_args}chunked_prefill=True,"
 fi
 
-gen_args="use_block_cache=True,max_new_tokens=2048,block_size=32,small_block_size=8,threshold=0.9"
+case "${BLOCK_CACHE:-1}" in
+  1) use_block_cache=True ;;
+  0) use_block_cache=False ;;
+  *) echo "BLOCK_CACHE must be 0 or 1, got '$BLOCK_CACHE'" >&2; exit 1 ;;
+esac
+gen_args="use_block_cache=${use_block_cache},max_new_tokens=2048,block_size=32,small_block_size=8,threshold=0.9"
 ll_args="block_size=32,small_block_size=8"
 common_args="already_templated=True,show_io=False"
 
