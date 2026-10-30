@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Cross-compile the Fast-dLLM v2 Relax artifact for a Mac (Apple silicon, Metal), float16.
 
-Builds `FastDLLMRelaxForCausalLMNative` (`fast_dllm_relax/model/metal.py`: in-graph attention, no
-fast_dllm.flash_attn_bf16 callback, plus static-shape variants) with the `opt_fast_dllm_llm_native`
+Builds `FastDLLMRelaxForCausalLMNative` (`fast_dllm_relax/model/metal.py`: in-place KV cache written
+and attended in-graph, no Python callbacks, plus static-shape variants) with the `opt_fast_dllm_llm_native`
 pipeline (dlight only, no cuBLAS/CUTLASS, no CUDA graph) for Metal (MSL source) + an
 arm64-apple-macos host. Device kernels index in int32 by default (`--no-index-narrow-i32` keeps
 int64); such an artifact caps prompt + generation at NARROW_I32_MAX_TOTAL_LEN tokens, recorded in
@@ -12,6 +12,7 @@ the manifest and enforced by the runner. Writes:
       fast_dllm_relax_nn.tar              Mach-O arm64 host objects + devc.o (MSL source)
       fast_dllm_relax_nn_params.npz / _param_names.txt / _dtype.txt
       fast_dllm_relax_nn_metal_manifest.json
+      fast_dllm_relax_nn_kv_cache.json    KV-cache contract (export_utils.KV_CACHE_CONTRACT)
 
 Runs either on a Linux workstation whose TVM was built with configs/tvm/cuda.cmake (USE_METAL=OFF
 plus the patched build_metal_off.cc, LLVM with the AArch64 target), or on the Mac itself
@@ -48,6 +49,7 @@ from fast_dllm_relax.export_utils import (  # noqa: E402
     load_hf_weights,
     make_relax_config,
     remap_params,
+    write_kv_cache_manifest,
 )
 from fast_dllm_relax.model.metal import (  # noqa: E402
     METAL_STATIC_FNS,
@@ -94,15 +96,7 @@ def register_metallib_compiler() -> bool:
     return True
 
 
-_NOT_PORTED = (
-    "The Metal model is not ported to the in-place KV cache yet (plan 003: "
-    ".codex/thoughts/shared/plans/003_inplace_kv_cache_and_q1_fix.md), and the runner no longer "
-    "loads functional-cache artifacts."
-)
-
-
 def main() -> None:
-    raise SystemExit(_NOT_PORTED)
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--revision", default=DEFAULT_MODEL_REVISION,
@@ -153,8 +147,9 @@ def main() -> None:
     missing_fns = sorted(set(REQUIRED_FNS + METAL_STATIC_FNS) - set(exported_fns))
     if missing_fns:
         raise RuntimeError(f"native module is missing functions: {missing_fns}")
-    if "flash_attn" in mod.script():
-        raise RuntimeError("native module references flash_attn")
+    script = mod.script()
+    if "fast_dllm." in script or "call_inplace_packed" in script:
+        raise RuntimeError("native module calls a fast_dllm.* Python callback (CUDA-only)")
 
     mapped = remap_params(state_dict, named_param_dict, relax_config,
                           torch_dtype=TORCH_DTYPES[dtype], np_dtype=NP_DTYPES[dtype])
@@ -227,7 +222,8 @@ def main() -> None:
     }
     manifest_path = artifact_dir / "fast_dllm_relax_nn_metal_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"  Wrote manifest: {manifest_path}")
+    write_kv_cache_manifest(artifact_dir, relax_config, dtype)
+    print(f"  Wrote manifests: {manifest_path.name}, KV-cache contract")
     print(f"\n=== COMPLETE: {dtype} artifact compiled for Metal: {artifact_dir} ===")
     if platform.system() != "Darwin":
         print("Copy the directory to the Mac (same relative path), then from the repo root there:")

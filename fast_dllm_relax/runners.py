@@ -623,7 +623,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
             except Exception:
                 raise RuntimeError(
                     f"Relax artifact is missing cache-aware global '{_fn_name}'. "
-                    "Re-export the artifact with scripts/export_cuda.py."
+                    "Re-export the artifact with scripts/export_cuda.py (or scripts/export_metal.py)."
                 ) from None
         try:
             self.vm["forward_block_partial_rp0"]
@@ -827,8 +827,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
             raise RuntimeError(
                 f"Relax artifact {self.artifact_dir} does not use the in-place KV cache "
                 f"(no {KV_CACHE_MANIFEST} with kv_cache={KV_CACHE_CONTRACT!r}). Re-export it with "
-                "scripts/export_cuda.py; Metal artifacts are not supported until the Metal model is "
-                "ported to the in-place KV cache."
+                "scripts/export_cuda.py (or scripts/export_metal.py)."
             )
         return CacheSpec(
             num_layers=int(manifest["num_layers"]),

@@ -9,7 +9,7 @@ Hugging Face reference implementation on nine lm-eval tasks. The repo covers thr
 |---|---|---|---|
 | Desktop NVIDIA GPU (default) | bf16 or fp16, cuBLAS + CUTLASS + dlight | the GPU machine | the GPU machine |
 | Jetson Orin | bf16 or fp16, cuBLAS + dlight (no CUTLASS) | x86_64 workstation (cross-compile) | Jetson Orin |
-| Apple-silicon Mac (Metal) — **not ported to the in-place KV cache yet** (see Notes) | fp16, dlight only, in-graph attention, int32 kernel indexing | x86_64 workstation (cross-compile), or the Mac | Mac (linked there) |
+| Apple-silicon Mac (Metal) | fp16 (default) or bf16, dlight + tuned simdgroup-MMA GEMMs, in-graph KV cache and attention, int32 kernel indexing | x86_64 workstation (cross-compile), or the Mac | Mac (linked there) |
 
 The compiled model keeps the Fast-dLLM v2 decoding algorithm: 32-token blocks, refined in 8-token
 sub-blocks, with every position above a 0.9 confidence threshold unmasked in parallel. It also
@@ -37,7 +37,7 @@ patches/                 local TVM patch (applied by scripts/setup_tvm.sh)
 configs/tvm/             config.cmake presets: cuda, jetson, mac
 fast_dllm_relax/
   model/cuda.py          Relax model + opt_fast_dllm_llm_cublas pipeline (desktop GPU, Jetson)
-  model/metal.py         in-graph-attention variant + opt_fast_dllm_llm_native pipeline (Metal)
+  model/metal.py         in-graph KV-cache/attention variant + opt_fast_dllm_llm_native pipeline (Metal)
   runtime.py             block-diffusion decoding loop, KV/block caches, loglikelihood scoring
   runners.py             HF baseline runner and Relax runner (shared metrics/recording)
   lm_eval_harness.py     lm-eval model types `fast_dllm_baseline` and `fast_dllm_relax`
@@ -191,9 +191,18 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
   - A Mac-native export of the same commit has the same weights and equivalent kernels, and is
     token-identical.
   - The first run after linking is slower while macOS compiles and caches the Metal shaders.
+  - Kernel/runtime work since (on-device confidence, simdgroup-MMA attention, tuned GEMM tiles)
+    kept those outputs token-identical at ~68.1 tok/s. The default is now fp16 weights with fp32
+    GEMM accumulation, whose MMLU loglikelihoods are about 5x closer to the HF model (mean |Δ| 0.018
+    vs 0.093 against HF fp32 on 40 requests; 0.013 against HF fp16).
+  - In-place KV cache (Mac-native export, default fp16): GSM8K first 200 token-identical to the
+    previous Metal artifact on the 192 prompts that are not a multiple of 32 tokens long; the other 8
+    now start with HF's first token (the prompt-aligned fix). Accuracy 62.0%, ~68.2 tok/s. MMLU
+    (1,140 requests) loglikelihoods bit-identical, accuracy 57.2%. bf16 (`--dtype bfloat16`): the
+    same checks pass against the previous bf16 artifact (63.0% / 58.6%, ~66.1 tok/s).
+  - The workstation cross-compiled build of the current version has not been re-validated yet.
 
-  These results predate the in-place KV cache (plan 003). Until the Metal model is ported,
-  `scripts/export_metal.py` refuses to run and the runner refuses Metal artifacts. The device check was:
+  To check on the device:
   1. `bash scripts/setup_tvm.sh mac`
   2. `python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
   3. `python -m fast_dllm_relax.cli --backend relax --use-block-cache --device metal:0 --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
@@ -216,24 +225,34 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
   `fast_dllm.attn_inplace` (a call_inplace_packed): it writes the rows' K/V into the cache, then runs
   `flash_attn` if installed, otherwise PyTorch SDPA with `enable_gqa`. `build_prefix_cache` writes
   its rows through `fast_dllm.kv_write`. PyTorch is therefore a runtime dependency, and each layer
-  pays a synchronous host round-trip (≈0.01–0.15 ms per step; research 002). The Metal model computes
-  attention in-graph instead and has not been ported to the in-place cache yet.
+  pays a synchronous host round-trip (≈0.01–0.15 ms per step; research 002). The Metal model has no
+  callbacks: each layer writes its K/V rows with an in-graph kernel (`call_tir_inplace`), copies
+  rows `[0, prefix_len + block)` of that layer into a contiguous tensor (Metal has no zero-copy
+  offset views) and computes attention in-graph. Its artifacts use the same cache contract and
+  manifest.
 - **Pass order matters.** The CUDA pipeline partitions cuBLAS before CUTLASS. CUTLASS's generic
   dense pattern would otherwise claim the projection GEMMs first, and cuBLAS would silently get
   nothing.
 - **Precision.** RMSNorm, SiLU and attention follow the HF model's precision order, with fp32
   accumulation where PyTorch uses it. Generated text is close to the HF reference but not
   bit-identical.
-- **Mac.** Only the Relax backend has been validated on the Mac. Metal is fp16-only, because bf16
-  needs MSL 3.1.
+- **Mac.** Only the Relax backend has been validated on the Mac. `export_metal.py` options:
+  `--gemm-acc` sets the projection/lm_head GEMM accumulator (default `float32`; `float16` is
+  slightly faster and less accurate); `--dtype bfloat16` builds a bf16 artifact (always fp32
+  accumulation), whose kernels the runtime compiles as MSL 3.1, so it needs macOS 14+;
+  `--metallib` precompiles the kernels with `xcrun metal` when Xcode is installed (Mac-native
+  exports only; otherwise MSL source is compiled at load). `link_metal.py` also runs an on-device
+  check that every cache function writes only its own cache rows.
 - **Metal fast path.** Relax shape variables are int64, so by default every symbolic-shape Metal
   kernel indexes in emulated 64-bit, several times slower than int32. `export_metal.py` narrows
   device-kernel indexing to int32 (`--no-index-narrow-i32` keeps int64). The int32 indices would
   overflow past about 13.4k tokens, so such artifacts record `max_total_len = 12288` (prompt +
   generation + one block of padding) in their manifest, and the runner rejects longer requests. The
   artifact also carries static-shape variants of the cached forwards (32 rows) and `get_logits`
-  (8 and 32 rows), which the runtime picks automatically. Opt-outs for A/B runs:
-  `FAST_DLLM_DISABLE_B32=1`, `FAST_DLLM_DISABLE_STATIC_LOGITS=1`.
+  (8 and 32 rows), which the runtime picks automatically, and `get_confidence_m{8,32}`, which reduce
+  each step's logits to the per-row argmax and max softmax probability on the GPU. Opt-outs for A/B
+  runs: `FAST_DLLM_DISABLE_B32=1`, `FAST_DLLM_DISABLE_STATIC_LOGITS=1`,
+  `FAST_DLLM_DISABLE_GPU_CONFIDENCE=1`.
 
 ## Citation
 

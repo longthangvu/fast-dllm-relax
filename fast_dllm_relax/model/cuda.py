@@ -329,31 +329,6 @@ def _apply_rotary_pos_emb_with_offset(
     return q_embed, k_embed
 
 
-def _splice_window(block: Tensor, active: Tensor, replace_position: int, sbs: int, block_size: int) -> Tensor:
-    """Functional block-cache update: rebuild the block buffer (axis 2) with `active` at [replace_position, +sbs)."""
-    parts: list[Tensor] = []
-    if replace_position > 0:
-        parts.append(
-            wrap_nested(
-                rx.op.strided_slice(block._expr, begin=[0], end=[replace_position], strides=[1], axes=[2]),
-                "block_before",
-            )
-        )
-    parts.append(active)
-    if replace_position + sbs < block_size:
-        parts.append(
-            wrap_nested(
-                rx.op.strided_slice(
-                    block._expr, begin=[replace_position + sbs], end=[block_size], strides=[1], axes=[2]
-                ),
-                "block_after",
-            )
-        )
-    if len(parts) == 1:
-        return parts[0]
-    return op.concat(parts, dim=2)
-
-
 def _silu_fp32(x: Tensor, name: str = "silu_fp32") -> Tensor:
     """SiLU computed via fp32 intermediate precision, matching PyTorch's CUDA SiLU
     kernel (opmath convention for reduced-precision dtypes). TVM's op.silu computes

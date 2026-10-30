@@ -233,7 +233,13 @@ class PrefixCache:
             return
         bigger = allocate_prefix_cache(self.spec, dev, rows)
         for old, new in ((self.k, bigger.k), (self.v, bigger.v)):
-            torch.from_dlpack(new)[:, :, : self.prefix_len].copy_(torch.from_dlpack(old)[:, :, : self.prefix_len])
+            if _is_cuda(old):
+                torch.from_dlpack(new)[:, :, : self.prefix_len].copy_(torch.from_dlpack(old)[:, :, : self.prefix_len])
+            else:
+                # torch cannot import Metal tensors; go through host memory (unified on Apple silicon).
+                host = np.empty(new.shape, dtype=old.numpy().dtype)
+                host[:, :, : self.prefix_len] = old.numpy()[:, :, : self.prefix_len]
+                new.copyfrom(host)
         self.k, self.v = bigger.k, bigger.v
 
 

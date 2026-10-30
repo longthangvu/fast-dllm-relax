@@ -1,29 +1,26 @@
 """Native-attention Relax model + pipeline for non-CUDA targets (Metal).
 
-Sibling of the CUDA model (`model/cuda.py`) that changes no CUDA behavior. The CUDA model computes
-`forward_cached` and `forward_block_partial_perlayer` attention through the
-`fast_dllm.flash_attn_bf16` Python callback (torch SDPA/flash-attn, `runtime.py`), which cannot run
-on Metal. This module overrides only those two attention methods so attention is computed in-graph:
-  concat(prefix, active/updated block) -> repeat GQA -> fp32 QK^T -> softmax -> fp32 PV -> cast.
-No bias is needed: the active block sees the whole block-aligned prefix
-(`model/cuda.py` `build_cached_attention_bias` is all zeros), and the callback likewise attends with
-causal=False and no bias.
+Sibling of the CUDA model (`model/cuda.py`) that changes no CUDA behavior. Both models share the
+in-place KV-cache contract (`export_utils.KV_CACHE_CONTRACT`): one preallocated cache per K and V,
+[num_layers, 1, cap, num_kv_heads, head_dim] (BSNH rows), written in place by every cache function.
+The CUDA model writes and attends through Python callbacks (`fast_dllm.attn_inplace` /
+`fast_dllm.kv_write`, torch flash-attn/SDPA in `runtime.py`), which cannot run on Metal. This module
+does both in the graph:
+  - `kv_write_kernel`, called through call_tir_inplace, writes a layer's post-RoPE K/V rows;
+  - attention slices rows [0, prefix_len + attend_rel) of that layer out of the written cache into
+    contiguous BHSD K/V (the same tensors the functional cache's concat(prefix, active) produced),
+    then runs GQA attention in-graph: fp32 QK^T -> softmax -> fp32 PV -> cast. No bias is needed:
+    the active block sees the whole block-aligned prefix, as in the CUDA callback.
 
 The module attribute tree is identical to the CUDA model (`model.layers[i].self_attn.*`), so the
 exported parameter names/order -- and therefore `remap_params` and the npz/param_names artifact
-format -- are unchanged. Exported functions are the same ten, plus four static-shape variants
-(`METAL_STATIC_FNS`) whose fixed row counts compile to faster Metal kernels.
+format -- are unchanged. Exported functions are the CUDA set (`export_utils.REQUIRED_FNS`) plus the
+static-shape variants in `METAL_STATIC_FNS`, whose fixed row counts compile to faster Metal kernels.
 
 The module also defines the device-kernel int32 index narrowing (`metal_tir_pipeline`) used for
 Metal builds, with its total-length cap `NARROW_I32_MAX_TOTAL_LEN`.
 
 Build with `scripts/export_metal.py` (on a Linux workstation or on the Mac).
-
-NOT PORTED to the in-place KV cache (plan 003). The CUDA model's cache contract changed: one
-preallocated BSNH cache written in place through the `fast_dllm.attn_inplace` / `fast_dllm.kv_write`
-callbacks. This module still overrides the old functional-cache methods, so it no longer exports;
-`scripts/export_metal.py` refuses to run and the runner refuses Metal artifacts until a port (an
-in-graph row write via call_tir_inplace plus attention over a sliced view) lands.
 """
 
 import tvm
@@ -32,6 +29,7 @@ from tvm import s_tir, tirx
 from tvm.relax import register_pipeline
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
+from tvm.relax.frontend.nn.core import wrap_nested
 from tvm.script import tirx as T
 from tvm.s_tir import dlight
 from tvm.s_tir.dlight.analysis import get_root_block
@@ -44,7 +42,6 @@ from .cuda import (
     FastDLLMRelaxForCausalLM,
     FastDLLMRelaxModel,
     _apply_rotary_pos_emb_with_offset,
-    _splice_window,
 )
 
 
@@ -251,29 +248,69 @@ def metal_tir_pipeline(narrow_i32: bool):
 # Static-shape siblings of the dynamic functions, Metal artifacts only. The runtime uses one when
 # the row count matches and the artifact has it, and falls back to the dynamic function otherwise.
 METAL_STATIC_FNS = (
-    "forward_cached_b32", "forward_cached_block_b32", "get_logits_m8", "get_logits_m32",
-    "get_confidence_m8", "get_confidence_m32",
+    "forward_cached_b32", "get_logits_m8", "get_logits_m32", "get_confidence_m8", "get_confidence_m32",
 )
 
 
-def _stack_kernel(shapes: list, dtype: str) -> tirx.PrimFunc:
-    """Opaque (never fused) concat of [1, ...] tensors along axis 0; see
-    FastDLLMRelaxModelNative._stack_layers. Symbolic dims (prefix_len) become shape vars bound
-    from the buffers."""
-    from tvm import te, topi  # pylint: disable=import-outside-toplevel
+def kv_write_kernel(num_layers: int, num_kv_heads: int, head_dim: int, dtype: str) -> tirx.PrimFunc:
+    """In-place KV-cache row write: k_cache[layer, 0, start + r] = k[0, r] (same for v), r < rows.
 
-    sym: dict[str, tirx.Var] = {}
+    Called through call_tir_inplace (`_kv_write`), so the caches are both inputs and outputs and
+    nothing is copied besides the written rows. `layer` and `start` are scalar args, so every layer
+    and row offset shares this one kernel; `rows` and `cap` bind from the buffers. Self-scheduled
+    (one threadgroup per (row, kv head), one thread per head_dim element) and opaque, so FuseOps
+    keeps it a separate kernel. No bounds check: the runtime checks every write window before the
+    call (`runtime._check_write`).
+    """
+    n_heads, n_dim = T.int64(num_kv_heads), T.int64(head_dim)
 
-    def dim(d):
-        if isinstance(d, int):
-            return d
-        if isinstance(d, tirx.IntImm):
-            return int(d)
-        return sym.setdefault(str(d), tirx.Var(str(d), "int64"))
+    @T.prim_func(private=True)
+    def kv_write(
+        var_k: T.handle, var_v: T.handle, var_k_cache: T.handle, var_v_cache: T.handle,
+        layer: T.int64, start: T.int64,
+    ):
+        T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": True})
+        rows, cap = T.int64(), T.int64()
+        k = T.match_buffer(var_k, (T.int64(1), rows, n_heads, n_dim), dtype)
+        v = T.match_buffer(var_v, (T.int64(1), rows, n_heads, n_dim), dtype)
+        k_cache = T.match_buffer(var_k_cache, (T.int64(num_layers), T.int64(1), cap, n_heads, n_dim), dtype)
+        v_cache = T.match_buffer(var_v_cache, (T.int64(num_layers), T.int64(1), cap, n_heads, n_dim), dtype)
+        for bx in T.thread_binding(rows * n_heads, thread="blockIdx.x"):
+            for tx in T.thread_binding(n_dim, thread="threadIdx.x"):
+                with T.sblock("kv_write"):
+                    vr = T.axis.spatial(rows, bx // n_heads)
+                    vh = T.axis.spatial(n_heads, bx % n_heads)
+                    vd = T.axis.spatial(n_dim, tx)
+                    k_cache[layer, 0, start + vr, vh, vd] = k[0, vr, vh, vd]
+                    v_cache[layer, 0, start + vr, vh, vd] = v[0, vr, vh, vd]
 
-    inputs = [te.placeholder([dim(d) for d in shape], dtype, name=f"layer{i}") for i, shape in enumerate(shapes)]
-    out = topi.concatenate(inputs, axis=0)
-    return te.create_prim_func([*inputs, out]).with_attr("op_pattern", 8)  # kOpaque
+    return kv_write
+
+
+def _kv_write(k: Tensor, v: Tensor, k_cache: Tensor, v_cache: Tensor, layer: int, start) -> tuple[Tensor, Tensor]:
+    """Write k / v ([1, rows, num_kv_heads, head_dim]) at cache rows [start, start + rows) of `layer`.
+    Returns the written caches (aliases of the inputs); readers must use these so the write is
+    ordered before them and is not dead code."""
+    num_layers, _, _, num_kv_heads, head_dim = k_cache.shape
+    as_expr = lambda x: tirx.IntImm("int64", x) if isinstance(x, int) else x  # noqa: E731
+    return op.tensor_ir_inplace_op(
+        kv_write_kernel(int(num_layers), int(num_kv_heads), int(head_dim), k_cache.dtype),
+        "kv_write",
+        args=[k, v, k_cache, v_cache, as_expr(layer), as_expr(start)],
+        inplace_indices=[2, 3],
+        out=[Tensor.placeholder(k_cache.shape, k_cache.dtype), Tensor.placeholder(v_cache.shape, v_cache.dtype)],
+    )
+
+
+def _layer_rows_bhsd(cache: Tensor, layer: int, rows) -> Tensor:
+    """Cache rows [0, rows) of `layer` as a contiguous BHSD tensor [1, num_kv_heads, rows, head_dim].
+    assume_inbound keeps the slice's extent `rows` (FuseTIR cannot match the clamped form)."""
+    _, _, _, num_kv_heads, head_dim = cache.shape
+    sliced = wrap_nested(
+        rx.op.strided_slice(cache._expr, axes=[0, 2], begin=[layer, 0], end=[layer + 1, rows], assume_inbound=True),
+        "cache_rows",
+    )
+    return op.permute_dims(op.reshape(sliced, (1, rows, num_kv_heads, head_dim)), axes=[0, 2, 1, 3])
 
 
 def confidence_kernel(rows: int, vocab: int, threads: int = 1024) -> tirx.PrimFunc:
@@ -373,61 +410,33 @@ class FastDLLMRelaxAttentionNative(FastDLLMRelaxAttention):
     def forward_cached(
         self,
         hidden_states: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Same contract as FastDLLMRelaxAttention.forward_cached, in-graph attention."""
-        batch_size, block_len, _ = hidden_states.shape
+        layer: int,
+        prefix_len,
+        write_rel: int,
+        attend_rel,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Same contract as FastDLLMRelaxAttention.forward_cached, in-graph: write this call's
+        post-RoPE K/V at rows [prefix_len + write_rel, + seq_len) of this layer's cache, then attend
+        over rows [0, prefix_len + attend_rel) of the written cache. Returns (attn_output, k_cache,
+        v_cache), the caches being the written aliases."""
+        batch_size, seq_len, _ = hidden_states.shape
 
         q, k, v = self._project_qkv(hidden_states)
-        q = op.reshape(q, (batch_size, block_len, self.num_q_heads, self.head_dim))
-        k = op.reshape(k, (batch_size, block_len, self.num_kv_heads, self.head_dim))
-        v = op.reshape(v, (batch_size, block_len, self.num_kv_heads, self.head_dim))
+        q = op.reshape(q, (batch_size, seq_len, self.num_q_heads, self.head_dim))
+        k = op.reshape(k, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
+        v = op.reshape(v, (batch_size, seq_len, self.num_kv_heads, self.head_dim))
 
         q, k = _apply_rotary_pos_emb_with_offset(q, k, cache_offset, self.rope_theta, self.head_dim, self.dtype)
 
-        active_k = op.permute_dims(k, axes=[0, 2, 1, 3])
-        active_v = op.permute_dims(v, axes=[0, 2, 1, 3])
-
-        full_k = op.concat([prefix_k, active_k], dim=2)
-        full_v = op.concat([prefix_v, active_v], dim=2)
+        k_cache, v_cache = _kv_write(k, v, k_cache, v_cache, layer, prefix_len + write_rel)
+        full_k = _layer_rows_bhsd(k_cache, layer, prefix_len + attend_rel)
+        full_v = _layer_rows_bhsd(v_cache, layer, prefix_len + attend_rel)
 
         attn_out = self._attend_native(q, full_k, full_v)
-        return self.o_proj(attn_out), full_k, full_v, active_k, active_v
-
-    def forward_block_partial_perlayer(
-        self,
-        hidden_states: Tensor,
-        prefix_k: Tensor,
-        prefix_v: Tensor,
-        block_k: Tensor,
-        block_v: Tensor,
-        cache_offset: Tensor,
-        replace_position: int,
-        sbs: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Same contract as FastDLLMRelaxAttention.forward_block_partial_perlayer, in-graph attention."""
-        batch_size, _sbs, _ = hidden_states.shape
-
-        q, k, v = self._project_qkv(hidden_states)
-        q = op.reshape(q, (batch_size, _sbs, self.num_q_heads, self.head_dim))
-        k = op.reshape(k, (batch_size, _sbs, self.num_kv_heads, self.head_dim))
-        v = op.reshape(v, (batch_size, _sbs, self.num_kv_heads, self.head_dim))
-
-        q, k = _apply_rotary_pos_emb_with_offset(q, k, cache_offset, self.rope_theta, self.head_dim, self.dtype)
-
-        active_k = op.permute_dims(k, axes=[0, 2, 1, 3])
-        active_v = op.permute_dims(v, axes=[0, 2, 1, 3])
-
-        updated_block_k = _splice_window(block_k, active_k, replace_position, sbs, self.block_size)
-        updated_block_v = _splice_window(block_v, active_v, replace_position, sbs, self.block_size)
-
-        full_k = op.concat([prefix_k, updated_block_k], dim=2)
-        full_v = op.concat([prefix_v, updated_block_v], dim=2)
-
-        attn_out = self._attend_native(q, full_k, full_v)
-        return self.o_proj(attn_out), active_k, active_v, updated_block_k, updated_block_v
+        return self.o_proj(attn_out), k_cache, v_cache
 
 
 class FastDLLMRelaxDecoderLayerNative(FastDLLMRelaxDecoderLayer):
@@ -450,20 +459,16 @@ class FastDLLMRelaxModelNative(FastDLLMRelaxModel):
             ]
         )
 
-    def _stack_layers(self, per_layer: list[Tensor], name: str) -> Tensor:
-        """Stack per-layer K/V with an opaque copy kernel instead of a fusible concat.
-
-        FuseOps (Relax) does not enforce the target's max_function_args, so the 28-input concat
-        can absorb a layer's RoPE producers and exceed Metal's 31 buffer slots (observed with
-        --gemm-acc float32: 31 tensors + the scalar-argument buffer). As an opaque call it keeps
-        exactly num_layers inputs + 1 output (+ the scalar buffer); the copy is bit-exact.
-        """
-        return op.tensor_ir_op(
-            _stack_kernel([t.shape for t in per_layer], per_layer[0].dtype),
-            name,
-            args=per_layer,
-            out=Tensor.placeholder([len(per_layer), *per_layer[0].shape[1:]], per_layer[0].dtype),
-        )
+    def build_prefix_cache(
+        self, prefix_embed: Tensor, prefix_bias: Tensor, k_cache: Tensor, v_cache: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """FastDLLMRelaxModel.build_prefix_cache with the per-layer K/V written in-graph (`_kv_write`)
+        instead of through the fast_dllm.kv_write callback."""
+        hidden_states = prefix_embed
+        for i, layer in enumerate(self.layers):
+            hidden_states, k_i, v_i = layer.forward_and_collect_kv(hidden_states, prefix_bias)
+            k_cache, v_cache = _kv_write(k_i, v_i, k_cache, v_cache, i, 0)
+        return k_cache, v_cache
 
 
 class FastDLLMRelaxForCausalLMNative(FastDLLMRelaxForCausalLM):
@@ -480,22 +485,14 @@ class FastDLLMRelaxForCausalLMNative(FastDLLMRelaxForCausalLM):
     def forward_cached_b32(
         self,
         active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
         cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """forward_cached with a static bd_size-row active block (block append, chunked prefill)."""
-        return self.model.forward_cached(active_embed, cached_k, cached_v, cache_offset)
-
-    def forward_cached_block_b32(
-        self,
-        active_embed: Tensor,
-        cached_k: Tensor,
-        cached_v: Tensor,
-        cache_offset: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """forward_cached_block with a static bd_size-row active block (refinement, loglikelihood)."""
-        return self.model.forward_cached_block(active_embed, cached_k, cached_v, cache_offset)
+        prefix_len: int,
+    ) -> Tensor:
+        """forward_cached with a static bd_size-row active block (refinement, block-append,
+        chunked prefill, scoring)."""
+        return self.model.forward_cached(active_embed, k_cache, v_cache, cache_offset, prefix_len)
 
     def get_logits_m8(self, hidden_states: Tensor) -> Tensor:
         """get_logits for the bd_size // 4-row partial path, static M."""
@@ -532,10 +529,9 @@ class FastDLLMRelaxForCausalLMNative(FastDLLMRelaxForCausalLM):
 
     def _default_spec_raw(self) -> dict:
         raw = super()._default_spec_raw()
-        for name, base in (("forward_cached_b32", "forward_cached"), ("forward_cached_block_b32", "forward_cached_block")):
-            spec = dict(raw[base])
-            spec["active_embed"] = nn.spec.Tensor([1, self.bd_size, self.hidden_size], self.dtype)
-            raw[name] = spec
+        spec = dict(raw["forward_cached"])
+        spec["active_embed"] = nn.spec.Tensor([1, self.bd_size, self.hidden_size], self.dtype)
+        raw["forward_cached_b32"] = spec
         for name, rows in (
             ("get_logits_m8", self.bd_size // 4), ("get_logits_m32", self.bd_size),
             ("get_confidence_m8", self.bd_size // 4), ("get_confidence_m32", self.bd_size),
