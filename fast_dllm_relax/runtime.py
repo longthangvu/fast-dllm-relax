@@ -104,6 +104,59 @@ def static_fn_name(vm: Any, base: str, rows: int) -> str:
     return name
 
 
+# Device-side confidence. Metal artifacts carry get_confidence_m{rows} (`model/metal.py`), which
+# reduces the logits to per-row argmax + max softmax probability on the GPU, so a step reads back
+# 2 x rows values instead of [1, rows, vocab] fp32 logits. Without it (CUDA/Jetson artifacts, or
+# FAST_DLLM_DISABLE_GPU_CONFIDENCE=1, read once per VM and row count) the logits are reduced in
+# PyTorch on the host.
+_confidence_fn_cache: dict[tuple[int, int], str | None] = {}
+
+
+def confidence_fn_name(vm: Any, rows: int) -> str | None:
+    key = (id(vm), int(rows))
+    if key not in _confidence_fn_cache:
+        name = None
+        if os.environ.get("FAST_DLLM_DISABLE_GPU_CONFIDENCE") != "1":
+            candidate = f"get_confidence_m{int(rows)}"
+            try:
+                vm[candidate]
+                name = candidate
+            except Exception:  # noqa: BLE001 -- absent from this artifact
+                pass
+        _confidence_fn_cache[key] = name
+    return _confidence_fn_cache[key]
+
+
+def _tvm_to_numpy(t: Any) -> np.ndarray:
+    return t.numpy()
+
+
+def shifted_confidence(vm: Any, params: list[Any], hidden: Any) -> tuple[np.ndarray, np.ndarray, int]:
+    """Greedy token and confidence per position of `hidden` ([1, rows, hidden_size]).
+
+    Returns:
+        shifted_token_ids: [rows] int64 numpy   — argmax of the previous row's logits (row 0: its own)
+        max_probs:         [rows] float32 numpy — matching max softmax probability
+        last_token:        int — unshifted argmax of the last row (the token after the block)
+    """
+    rows = int(hidden.shape[1])
+    conf_fn = confidence_fn_name(vm, rows)
+    if conf_fn is not None:
+        ids_tvm, maxp_tvm = vm[conf_fn](hidden, params)              # [1, rows] int32 / fp32
+        ids = _tvm_to_numpy(ids_tvm)[0].astype(np.int64)
+        maxp = _tvm_to_numpy(maxp_tvm)[0]
+        shifted_ids = np.concatenate([ids[:1], ids[:-1]])
+        shifted_maxp = np.concatenate([maxp[:1], maxp[:-1]])
+        return shifted_ids, shifted_maxp, int(ids[-1])
+
+    logits_tvm = vm[static_fn_name(vm, "get_logits", rows)](hidden, params)  # [1, rows, vocab]
+    logits = _tvm_to_torch(logits_tvm)
+    shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+    shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()      # [rows]
+    max_probs = shifted.softmax(dim=-1).max(dim=-1).values[0].cpu().numpy()  # [rows]
+    return shifted_token_ids, max_probs, int(logits[0, -1, :].argmax().item())
+
+
 def selected_fn_names(vm: Any, *, block_size: int, small_block_size: int) -> dict[str, str]:
     """Which compiled function each generation call site dispatches to (for run metrics)."""
     return {
@@ -111,6 +164,8 @@ def selected_fn_names(vm: Any, *, block_size: int, small_block_size: int) -> dic
         "append_forward_fn": static_fn_name(vm, "forward_cached", block_size),
         "logits_fn": static_fn_name(vm, "get_logits", block_size),
         "partial_logits_fn": static_fn_name(vm, "get_logits", small_block_size),
+        "confidence_fn": confidence_fn_name(vm, block_size) or "host",
+        "partial_confidence_fn": confidence_fn_name(vm, small_block_size) or "host",
     }
 
 
@@ -219,12 +274,13 @@ def score_active_block_cached_fast(
     prefix_cache: PrefixCache,
 ) -> tuple[np.ndarray, np.ndarray, int, PrefixCache]:
     """Full active-block scoring that commits the extended cache: compiled forward_cached +
-    get_logits, PyTorch reductions. Used at block-append; refinement steps use
+    `shifted_confidence`. Used at block-append; refinement steps use
     `score_active_block_refine`, which skips building the extended cache.
 
-    The lm_head GEMM runs in the artifact (get_logits); argmax/softmax/max run in PyTorch on a
-    zero-copy DLPack view, which is much faster than TVM's generic reduction kernels for
-    [1, block_len, vocab_size] tensors.
+    The lm_head GEMM runs in the artifact. The argmax/softmax/max reductions run on the device
+    when the artifact has get_confidence_m{rows} (Metal); otherwise in PyTorch on a zero-copy
+    DLPack view (CUDA), which is much faster than TVM's generic reduction kernels for
+    [1, block_len, vocab_size] tensors there.
 
     Returns:
         shifted_token_ids:   [block_len] int64 numpy — token to unmask at each position
@@ -246,12 +302,7 @@ def score_active_block_cached_fast(
         embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
     )
 
-    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)  # [1, block_len, vocab]
-    logits = _tvm_to_torch(logits_tvm)
-    shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-    shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()      # [block_len]
-    max_probs = shifted.softmax(dim=-1).max(dim=-1).values[0].cpu().numpy()  # [block_len]
-    block_append_token = int(logits[0, -1, :].argmax().item())       # scalar
+    shifted_token_ids, max_probs, block_append_token = shifted_confidence(vm, params, hidden)
 
     new_prefix_cache = PrefixCache(
         cached_k=new_cached_k,
@@ -296,11 +347,7 @@ def score_active_block_refine(
         embedded, prefix_cache.cached_k, prefix_cache.cached_v, cache_offset, params
     )
 
-    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)  # [1, block_len, vocab]
-    logits = _tvm_to_torch(logits_tvm)
-    shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-    shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()      # [block_len]
-    max_probs = shifted.softmax(dim=-1).max(dim=-1).values[0].cpu().numpy()  # [block_len]
+    shifted_token_ids, max_probs, _ = shifted_confidence(vm, params, hidden)
 
     block_cache = BlockCache(
         block_k=block_k,
@@ -353,12 +400,7 @@ def score_active_block_partial_perlayer(
         params,
     )
 
-    # get_logits + DLPack + PyTorch reductions (same pattern as score_active_block_cached_fast)
-    logits_tvm = vm[static_fn_name(vm, "get_logits", hidden.shape[1])](hidden, params)
-    logits = _tvm_to_torch(logits_tvm)                              # [1, sbs, vocab]
-    shifted = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-    shifted_token_ids = shifted.argmax(dim=-1)[0].cpu().numpy()     # [sbs]
-    max_probs = shifted.softmax(dim=-1).max(dim=-1).values[0].cpu().numpy()  # [sbs]
+    shifted_token_ids, max_probs, _ = shifted_confidence(vm, params, hidden)
 
     new_block_cache = BlockCache(
         block_k=new_bk_tvm,

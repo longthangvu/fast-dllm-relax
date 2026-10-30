@@ -78,10 +78,79 @@ index a0907a767..f01724cf8 100644
          if lhs_shape[-1] % 4 != 0:
              # Reduction axis must be multiples of 4 for IGEMM
 diff --git a/python/tvm/s_tir/dlight/gpu/matmul.py b/python/tvm/s_tir/dlight/gpu/matmul.py
-index ef9392cc2..18af93e85 100644
+index ef9392cc2..af70dacfa 100644
 --- a/python/tvm/s_tir/dlight/gpu/matmul.py
 +++ b/python/tvm/s_tir/dlight/gpu/matmul.py
-@@ -578,10 +578,12 @@ class MatmulTensorization(GPUScheduleRule):
+@@ -344,8 +344,29 @@ def check_sm_version(arch: str) -> int:
+ class MetalMatmul(GPUScheduleRule):
+     """
+     The schedule rule for Metal matmul computation.
++
++    The tile configuration can be overridden per instance; the defaults are the original fixed
++    configuration. Every configuration accumulates K in order (k0, then k1, then the 8-wide
++    simdgroup multiply-accumulate), so tile choices do not change the reduction order.
+     """
+ 
++    def __init__(
++        self,
++        block_size_x: int = 16,
++        block_size_y: int = 16,
++        block_size_k: int = 32,
++        ty_len: int = 1,
++        tz_len: int = 4,
++        vector_size: int = 4,
++    ):
++        super().__init__()
++        self.block_size_x = block_size_x
++        self.block_size_y = block_size_y
++        self.block_size_k = block_size_k
++        self.ty_len = ty_len
++        self.tz_len = tz_len
++        self.vector_size = vector_size
++
+     def apply(  # pylint: disable=too-many-locals,missing-docstring
+         self,
+         func: tirx.PrimFunc,
+@@ -367,18 +388,20 @@ class MetalMatmul(GPUScheduleRule):
+             return None
+ 
+         # Step 0. Configs
+-        block_size_x: int = 16
+-        block_size_y: int = 16
+-        block_size_k: int = 32
++        block_size_x: int = self.block_size_x
++        block_size_y: int = self.block_size_y
++        block_size_k: int = self.block_size_k
+         micro_size: int = 8
+         warp_size: int = 32
+-        ty_len: int = 1
+-        tz_len: int = 4
+-        vector_size: int = 4
++        ty_len: int = self.ty_len
++        tz_len: int = self.tz_len
++        vector_size: int = self.vector_size
+ 
+         # Step 1. Normalize generic matmul to C[S, I, J] += A[S, I, K] * B[S, J, K]
+         # Reindex first and than analyze the index map
+         main_block = reduction_blocks[0]
++        # float16 -> float16, float16 -> float32 (mixed) and float32 -> float32 have intrinsics.
++        in_dtype, out_dtype = get_in_out_dtypes(sch.get(main_block))
+         reindex_a = sch.reindex(main_block, ("read", 0))
+         reindex_b = sch.reindex(main_block, ("read", 1))
+         reindex_c = sch.reindex(main_block, ("write", 0))
+@@ -448,9 +471,10 @@ class MetalMatmul(GPUScheduleRule):
+         intrin_group = get_simdgroup_intrin_group(
+             load_scope="shared",
+             store_scope="shared",
+-            dtype="float16",
++            dtype=in_dtype,
+             trans_a=False,
+             trans_b=True,
++            out_dtype=out_dtype,
+         )
+         sch.transform_layout(B_simdgroup, ("write", 0), lambda s, i, j: (s, j, i))
+ 
+@@ -578,10 +602,12 @@ class MatmulTensorization(GPUScheduleRule):
          i0, i1, i2, i3 = sch.split(i, factors=i_factors)
          j0, j1, j2, j3 = sch.split(j, factors=j_factors)
          k0, k1 = sch.split(k, k_factors)
@@ -98,7 +167,7 @@ index ef9392cc2..18af93e85 100644
  
          sch.reorder(i0, j0, i1, j1, j2, i2, k0, k1, i3, j3)
  
-@@ -799,10 +801,12 @@ class MatmulInt8Tensorization(GPUScheduleRule):
+@@ -799,10 +825,12 @@ class MatmulInt8Tensorization(GPUScheduleRule):
          i0, i1, i2, i3 = sch.split(i, factors=i_factors)
          j0, j1, j2, j3 = sch.split(j, factors=j_factors)
          k0, k1 = sch.split(k, k_factors)
@@ -115,6 +184,146 @@ index ef9392cc2..18af93e85 100644
  
          sch.reorder(i0, j0, i1, j1, j2, i2, k0, k1, i3, j3)
  
+diff --git a/python/tvm/s_tir/tensor_intrin/metal.py b/python/tvm/s_tir/tensor_intrin/metal.py
+index d14fdb3b1..9d419b1ef 100644
+--- a/python/tvm/s_tir/tensor_intrin/metal.py
++++ b/python/tvm/s_tir/tensor_intrin/metal.py
+@@ -193,20 +193,28 @@ def get_simdgroup_store_intrin(
+ 
+ 
+ def get_simdgroup_multiply_accumulate_intrin(
+-    m_dim: int, n_dim: int, k_dim: int, dtype: str
++    m_dim: int, n_dim: int, k_dim: int, dtype: str, out_dtype: str | None = None
+ ) -> tuple[PrimFunc, PrimFunc]:
++    """C (out_dtype) += A (dtype) * B (dtype). out_dtype defaults to dtype; a wider out_dtype
++    (e.g. float16 inputs with a float32 accumulator) maps to MSL's mixed-type
++    simdgroup_multiply_accumulate."""
++    out_dtype = out_dtype or dtype
++
++    def maybe_cast(v):
++        return v if out_dtype == dtype else T.cast(v, out_dtype)
++
+     @T.prim_func
+     def desc(a: T.handle, b: T.handle, c: T.handle) -> None:
+         A = T.match_buffer(a, (m_dim, k_dim), dtype, scope="metal.simdgroup", offset_factor=1)
+         B = T.match_buffer(b, (k_dim, n_dim), dtype, scope="metal.simdgroup", offset_factor=1)
+-        C = T.match_buffer(c, (m_dim, n_dim), dtype, scope="metal.simdgroup", offset_factor=1)
++        C = T.match_buffer(c, (m_dim, n_dim), out_dtype, scope="metal.simdgroup", offset_factor=1)
+         with T.sblock("root"):
+             T.reads(C[0:m_dim, 0:n_dim], A[0:m_dim, 0:k_dim], B[0:k_dim, 0:n_dim])
+             T.writes(C[0:m_dim, 0:n_dim])
+             for i, j, k in T.grid(m_dim, n_dim, k_dim):
+                 with T.sblock(""):
+                     vii, vjj, vkk = T.axis.remap("SSR", [i, j, k])
+-                    C[vii, vjj] += A[vii, vkk] * B[vkk, vjj]
++                    C[vii, vjj] += maybe_cast(A[vii, vkk]) * maybe_cast(B[vkk, vjj])
+ 
+     @T.prim_func
+     def impl(a: T.handle, b: T.handle, c: T.handle) -> None:
+@@ -218,7 +226,7 @@ def get_simdgroup_multiply_accumulate_intrin(
+             b, (k_dim, n_dim), dtype, scope="metal.simdgroup", strides=[b1, b0], offset_factor=1
+         )
+         C = T.match_buffer(
+-            c, (m_dim, n_dim), dtype, scope="metal.simdgroup", strides=[c1, c0], offset_factor=1
++            c, (m_dim, n_dim), out_dtype, scope="metal.simdgroup", strides=[c1, c0], offset_factor=1
+         )
+         with T.sblock("root"):
+             T.reads(C[0:m_dim, 0:n_dim], A[0:m_dim, 0:k_dim], B[0:k_dim, 0:n_dim])
+@@ -290,6 +298,42 @@ TensorIntrin.register(
+     *get_simdgroup_multiply_accumulate_intrin(8, 8, 8, "float16"),
+ )
+ 
++# float32 and bfloat16 groups: float16/bfloat16 x float16/bfloat16 -> float32 (mixed precision),
++# float32 x float32, and bfloat16 x bfloat16 -> bfloat16 (bfloat kernels need MSL 3.1).
++# Names follow get_simdgroup_intrin_group's scheme.
++
++SIMDGROUP_MULTI_ACC_8x8x8_f16f32_INTRIN = "simdgroup_multiply_accumulate_8x8x8_f16f32"
++TensorIntrin.register(
++    SIMDGROUP_MULTI_ACC_8x8x8_f16f32_INTRIN,
++    *get_simdgroup_multiply_accumulate_intrin(8, 8, 8, "float16", "float32"),
++)
++
++SIMDGROUP_MULTI_ACC_8x8x8_bf16f32_INTRIN = "simdgroup_multiply_accumulate_8x8x8_bf16f32"
++TensorIntrin.register(
++    SIMDGROUP_MULTI_ACC_8x8x8_bf16f32_INTRIN,
++    *get_simdgroup_multiply_accumulate_intrin(8, 8, 8, "bfloat16", "float32"),
++)
++
++for _dtype, _short in (("float32", "f32"), ("bfloat16", "bf16")):
++    TensorIntrin.register(
++        f"simdgroup_multiply_accumulate_8x8x8_{_short}",
++        *get_simdgroup_multiply_accumulate_intrin(8, 8, 8, _dtype),
++    )
++    TensorIntrin.register(
++        f"simdgroup_make_filled_8x8x8_{_short}",
++        *get_make_filled_simdgroup_matrix_intrin(_dtype, 8, 8),
++    )
++    for _scope in ("global", "shared"):
++        TensorIntrin.register(
++            f"simdgroup_store_8x8x8_{_short}_{_scope}",
++            *get_simdgroup_store_intrin(_dtype, _scope, 8, 8, False),
++        )
++    for _trans in (False, True):
++        TensorIntrin.register(
++            f"simdgroup_load_8x8x8_{_short}_shared{'_trans' if _trans else ''}",
++            *get_simdgroup_load_intrin(_dtype, "shared", 8, 8, _trans),
++        )
++
+ 
+ def get_simdgroup_intrin_group(
+     load_scope: Literal["shared"],
+@@ -297,6 +341,7 @@ def get_simdgroup_intrin_group(
+     dtype: str,
+     trans_a: bool = False,
+     trans_b: bool = False,
++    out_dtype: str | None = None,
+ ) -> dict[str, str]:
+     """Get a group of intrinsics for tensorization on Apple GPU.
+ 
+@@ -317,6 +362,10 @@ def get_simdgroup_intrin_group(
+     trans_b : bool
+         Whether the input matrix B is transposed.
+ 
++    out_dtype : Optional[str]
++        The accumulator / result data type; defaults to dtype. float16 inputs with a float32
++        accumulator select the mixed-precision multiply-accumulate.
++
+     Returns
+     -------
+     ret : Dict[str, str]
+@@ -325,9 +374,16 @@ def get_simdgroup_intrin_group(
+     assert load_scope in ["shared"]
+     assert store_scope in ["global", "shared"]
+     assert dtype in ["float16", "bfloat16", "float32"]
++    out_dtype = out_dtype or dtype
++    assert out_dtype in [dtype, "float32"]
+ 
+     shape = "8x8x8"
+-    dtype = "f16" if dtype == "float16" else "bf16" if dtype == "bfloat16" else "f32"
++
++    def short(d):
++        return "f16" if d == "float16" else "bf16" if d == "bfloat16" else "f32"
++
++    dtype, out_dtype = short(dtype), short(out_dtype)
++    mma_dtype = dtype if dtype == out_dtype else f"{dtype}{out_dtype}"
+     trans_a = "_trans" if trans_a else ""
+     trans_b = "_trans" if trans_b else ""
+ 
+@@ -336,11 +392,11 @@ def get_simdgroup_intrin_group(
+     # e.g. simdgroup_load_8x8x8_f16_shared_trans
+     load_b_intrin = f"simdgroup_load_{shape}_{dtype}_{load_scope}{trans_b}"
+     # e.g. simdgroup_multiply_accumulate_8x8x8_f16
+-    compute_intrin = f"simdgroup_multiply_accumulate_{shape}_{dtype}"
++    compute_intrin = f"simdgroup_multiply_accumulate_{shape}_{mma_dtype}"
+     # e.g. simdgroup_make_filled_8x8x8_f16
+-    init_intrin = f"simdgroup_make_filled_{shape}_{dtype}"
++    init_intrin = f"simdgroup_make_filled_{shape}_{out_dtype}"
+     # e.g. simdgroup_store_8x8x8_f16_global
+-    store_intrin = f"simdgroup_store_{shape}_{dtype}_{store_scope}"
++    store_intrin = f"simdgroup_store_{shape}_{out_dtype}_{store_scope}"
+ 
+     return {
+         "init": init_intrin,
 diff --git a/python/tvm/topi/nn/batch_matmul.py b/python/tvm/topi/nn/batch_matmul.py
 index 5143238d7..094467241 100644
 --- a/python/tvm/topi/nn/batch_matmul.py
@@ -247,6 +456,27 @@ index 03eb51463..2559a8bac 100644
      if (!const_arr_name.empty()) {
        // If there are constants, insert the __init_ and the wrapper
        // This segment would be generated in C++ because of the usage
+diff --git a/src/runtime/metal/metal_module.mm b/src/runtime/metal/metal_module.mm
+index 6837404ad..a2173c301 100644
+--- a/src/runtime/metal/metal_module.mm
++++ b/src/runtime/metal/metal_module.mm
+@@ -106,6 +106,16 @@ void WriteToFile(const ffi::String& file_name, const ffi::String& format) const
+     if (fmt_ == "metal") {
+       MTLCompileOptions* opts = [MTLCompileOptions alloc];
+       opts.languageVersion = MTLLanguageVersion2_3;
++      // bfloat (and simdgroup bfloat matrices) need MSL 3.1; every other kernel keeps 2.3 so
++      // existing float16/float32 kernels compile exactly as before.
++      if (source.find("bfloat") != std::string::npos) {
++        if (@available(macOS 14.0, iOS 17.0, *)) {
++          opts.languageVersion = MTLLanguageVersion3_1;
++        } else {
++          LOG(FATAL) << "Metal kernel " << func_name
++                     << " uses bfloat, which needs MSL 3.1 (macOS 14 / iOS 17 or newer)";
++        }
++      }
+       opts.fastMathEnabled = YES;
+       // opts = nil;
+       lib =
 diff --git a/src/target/opt/build_metal_off.cc b/src/target/opt/build_metal_off.cc
 index 7f544d92f..33ef33425 100644
 --- a/src/target/opt/build_metal_off.cc
@@ -325,3 +555,58 @@ index 7f544d92f..33ef33425 100644
  }
  
  }  // namespace runtime
+diff --git a/src/target/source/codegen_metal.cc b/src/target/source/codegen_metal.cc
+index 6831596c8..3badf1bd3 100644
+--- a/src/target/source/codegen_metal.cc
++++ b/src/target/source/codegen_metal.cc
+@@ -267,7 +267,11 @@ void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
+     }
+   } else if (t.is_bfloat16()) {
+     os << "bfloat";
+-    return;
++    if (lanes == 1) return;
++    if (lanes >= 2 && lanes <= 4) {  // MSL 3.1 bfloat2/3/4
++      os << lanes;
++      return;
++    }
+   }
+   TVM_FFI_THROW(InternalError) << "Cannot convert type " << t << " to Metal type";
+ }
+@@ -432,11 +436,16 @@ void CodeGenMetal::VisitExpr_(const FloatImmNode* op, std::ostream& os) {  // NO
+   } else if (std::isnan(op->value)) {
+     temp << "NAN";
+   } else {
+-    temp << std::scientific << op->value;
+-    if (op->dtype.bits() == 32)
+-      temp << 'f';
+-    else if (op->dtype.bits() == 16)
+-      temp << 'h';
++    if (op->dtype.is_bfloat16()) {
++      // MSL has no bfloat literal suffix; convert from a float literal.
++      temp << "bfloat(" << std::scientific << op->value << "f)";
++    } else {
++      temp << std::scientific << op->value;
++      if (op->dtype.bits() == 32)
++        temp << 'f';
++      else if (op->dtype.bits() == 16)
++        temp << 'h';
++    }
+   }
+   MarkConst(temp.str());
+   os << temp.str();
+diff --git a/src/tirx/transform/unsupported_dtype_legalize.cc b/src/tirx/transform/unsupported_dtype_legalize.cc
+index 555f2bbbc..1aa99e85a 100644
+--- a/src/tirx/transform/unsupported_dtype_legalize.cc
++++ b/src/tirx/transform/unsupported_dtype_legalize.cc
+@@ -732,6 +732,11 @@ namespace transform {
+ 
+ bool CheckDataTypeSupport(const Target& target, const std::string& support_func_name) {
+   bool has_native_support = false;
++  // Metal has a native bfloat type from MSL 3.1 (the Metal runtime compiles kernels that use it
++  // with MSL 3.1), including simdgroup bfloat matrices; keep bf16 storage and compute there.
++  if (target->kind->name == "metal" && support_func_name == "tvm.contrib.nvcc.supports_bf16") {
++    return true;
++  }
+   if (target->kind->name == "cuda") {
+     if (auto get_cv = tvm::ffi::Function::GetGlobal("tvm.contrib.nvcc.get_compute_version")) {
+       std::string compute_version = (*get_cv)(target).cast<std::string>();

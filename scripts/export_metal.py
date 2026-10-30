@@ -26,7 +26,10 @@ Usage (repo root, TVM env from scripts/setup_tvm.sh):
 import argparse
 import json
 import platform
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,7 +65,33 @@ from fast_dllm_relax.targets.metal import (  # noqa: E402
 )
 
 PIPELINE_NAME = "opt_fast_dllm_llm_native"
+TORCH_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+NP_DTYPES = {"float16": np.float16, "bfloat16": np.uint16}  # bf16 bits stored as uint16 (see dtype.txt)
 ARTIFACT_DIR = REPO_ROOT / "artifacts" / "fast_dllm_relax_fp16_metal"
+
+
+def register_metallib_compiler() -> bool:
+    """Register tvm_callback_metal_compile so BuildMetal emits metallib instead of MSL source.
+
+    Matches the runtime's source compile: fast math on; MSL 3.1 for kernels that use bfloat, 2.3
+    otherwise. Returns False (nothing registered) when the Metal compiler is unavailable."""
+    if shutil.which("xcrun") is None:
+        return False
+    if subprocess.run(["xcrun", "-sdk", "macosx", "--find", "metal"], capture_output=True).returncode != 0:
+        return False
+
+    @tvm.register_global_func("tvm_callback_metal_compile", override=True)
+    def _compile(code: str, _target) -> bytes:
+        std = "-std=metal3.1" if "bfloat" in code else "-std=macos-metal2.3"
+        with tempfile.TemporaryDirectory() as tmp:
+            src, air, lib = (Path(tmp) / n for n in ("k.metal", "k.air", "k.metallib"))
+            src.write_text(code, encoding="utf-8")
+            subprocess.run(["xcrun", "-sdk", "macosx", "metal", std, "-ffast-math", "-O3", "-c", str(src), "-o", str(air)],
+                           check=True)
+            subprocess.run(["xcrun", "-sdk", "macosx", "metallib", str(air), "-o", str(lib)], check=True)
+            return lib.read_bytes()
+
+    return True
 
 
 def main() -> None:
@@ -70,16 +99,31 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--revision", default=DEFAULT_MODEL_REVISION,
                         help="HF snapshot revision of --model (default: the pinned, validated one)")
-    parser.add_argument("--dtype", default="float16", choices=["float16"],
-                        help="float16 only: Metal bf16 needs MSL 3.1; the TVM Metal runtime compiles MSL 2.3.")
+    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"],
+                        help="weight/activation dtype. bfloat16 kernels compile as MSL 3.1 at load "
+                             "(macOS 14+; native bf16 arithmetic on M2 and newer); float16 as MSL 2.3.")
     parser.add_argument("--suffix", default="")
     parser.add_argument("--no-index-narrow-i32", dest="index_narrow_i32", action="store_false",
                         help="keep int64 device-kernel indexing (slower; no total-length cap)")
+    parser.add_argument("--gemm-acc", default=None, choices=["float16", "float32"],
+                        help="accumulator dtype of the projection/lm_head GEMMs (default float32; "
+                             "float16 reproduces the pre-plan-002 fp16-accumulation artifact; "
+                             "bfloat16 always accumulates in float32)")
+    parser.add_argument("--metallib", action="store_true",
+                        help="precompile kernels to metallib with `xcrun metal` (Mac with Xcode only; "
+                             "without it the artifact keeps MSL source, compiled at load)")
     args = parser.parse_args()
+    if args.dtype == "bfloat16":
+        if args.gemm_acc == "float16":
+            parser.error("--dtype bfloat16 accumulates in float32")
+        args.gemm_acc = "float32"
+    elif args.gemm_acc is None:
+        args.gemm_acc = "float32"
 
     dtype = args.dtype
     narrow_i32 = args.index_narrow_i32
-    artifact_dir = ARTIFACT_DIR.with_name(ARTIFACT_DIR.name + args.suffix) if args.suffix else ARTIFACT_DIR
+    base_dir = ARTIFACT_DIR if dtype == "float16" else ARTIFACT_DIR.with_name(ARTIFACT_DIR.name.replace("fp16", "bf16"))
+    artifact_dir = base_dir.with_name(base_dir.name + args.suffix) if args.suffix else base_dir
 
     print("Checking Metal cross toolchain ...")
     check_metal_cross_toolchain()
@@ -105,14 +149,21 @@ def main() -> None:
         raise RuntimeError("native module references flash_attn")
 
     mapped = remap_params(state_dict, named_param_dict, relax_config,
-                          torch_dtype=torch.float16, np_dtype=np.float16)
+                          torch_dtype=TORCH_DTYPES[dtype], np_dtype=NP_DTYPES[dtype])
     print(f"  Mapped {len(mapped)} params  (dtype={dtype})")
+
+    metal_output = "MSL source (tvm_callback_metal_compile not registered)"
+    if args.metallib:
+        if register_metallib_compiler():
+            metal_output = "metallib (xcrun metal, -ffast-math; MSL 3.1 for bfloat kernels, else 2.3)"
+        else:
+            print("  --metallib: `xcrun metal` not found (needs Xcode); keeping MSL source")
 
     target = metal_target()
     print(f"\nCompiling with {PIPELINE_NAME}, target={target} host={target.host}, "
           f"device index dtype={'int32' if narrow_i32 else 'int64'} ...")
     t1 = time.perf_counter()
-    ex = tvm.compile(mod, target, relax_pipeline=relax.get_pipeline(PIPELINE_NAME),
+    ex = tvm.compile(mod, target, relax_pipeline=relax.get_pipeline(PIPELINE_NAME, gemm_acc=args.gemm_acc),
                      tir_pipeline=metal_tir_pipeline(narrow_i32))
     compile_s = time.perf_counter() - t1
     print(f"  Compiled in {compile_s:.1f}s")
@@ -138,8 +189,8 @@ def main() -> None:
         raise RuntimeError(f"int32-narrowed build still has {tar_info['long_count']} 64-bit integer uses in its MSL")
 
     param_dtypes = sorted({str(a.dtype) for a in param_list})
-    if param_dtypes != ["float16"]:
-        raise RuntimeError(f"Non-fp16 params in Metal artifact: {param_dtypes}")
+    if param_dtypes != [np.dtype(NP_DTYPES[dtype]).name]:
+        raise RuntimeError(f"Unexpected param dtypes in {dtype} Metal artifact: {param_dtypes}")
 
     manifest = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -147,8 +198,9 @@ def main() -> None:
         "llvm_version": tvm.support.libinfo().get("LLVM_VERSION"),
         "target_device": METAL_TARGET_CONFIG,
         "target_host": METAL_HOST_TARGET_CONFIG,
-        "metal_output": "MSL source (tvm_callback_metal_compile not registered)",
+        "metal_output": metal_output,
         "pipeline": PIPELINE_NAME,
+        "gemm_acc": args.gemm_acc,
         "tir_pipeline": "s_tir+NarrowDeviceIndexToInt32" if narrow_i32 else "default",
         "device_index_dtype": "int32" if narrow_i32 else "int64",
         # Read by the runner: requests whose prompt + generation + block padding exceed it are rejected.

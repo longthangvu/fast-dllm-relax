@@ -29,7 +29,10 @@ REQUIRED_FNS = (
 )
 # fast_dllm_relax.model.metal.METAL_STATIC_FNS: optional (the runtime falls back to the dynamic
 # functions without them), reported so an artifact exported before they existed is easy to spot.
-STATIC_FNS = ("forward_cached_b32", "forward_cached_block_b32", "get_logits_m8", "get_logits_m32")
+STATIC_FNS = (
+    "forward_cached_b32", "forward_cached_block_b32", "get_logits_m8", "get_logits_m32",
+    "get_confidence_m8", "get_confidence_m32",
+)
 
 
 def main() -> int:

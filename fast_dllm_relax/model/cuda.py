@@ -748,9 +748,14 @@ class FastDLLMRelaxModel(nn.Module):
             hidden_states, k_i, v_i = layer.forward_and_collect_kv(hidden_states, prefix_bias)
             ks.append(wrap_nested(rx.op.expand_dims(k_i._expr, axis=0), "k_layer"))
             vs.append(wrap_nested(rx.op.expand_dims(v_i._expr, axis=0), "v_layer"))
-        cached_k = op.concat(ks, dim=0)
-        cached_v = op.concat(vs, dim=0)
+        cached_k = self._stack_layers(ks, "stack_k")
+        cached_v = self._stack_layers(vs, "stack_v")
         return cached_k, cached_v
+
+    def _stack_layers(self, per_layer: list[Tensor], name: str) -> Tensor:
+        """Concatenate per-layer [1, ...] tensors into [num_layers, ...] (build_prefix_cache).
+        The Metal model overrides this to keep the fused kernel within Metal's buffer limit."""
+        return op.concat(per_layer, dim=0)
 
     def _forward_cached_layers(
         self,
