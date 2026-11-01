@@ -756,7 +756,7 @@ def _probe_classes():
     return OneInput, TwoInput, Logits
 
 
-def make_probe(kind: str, inner_or_cfg, *, dtype: str, hidden_size: int, num_heads: int | None = None):
+def make_probe(kind: str, inner_or_cfg, *, dtype: str, hidden_size: int):
     """A module that exports ONE piece of the model as `forward_hidden`, plus its export spec.
 
     kind="one":    forward_hidden(x) = inner(x)                      (FastDLLMRMSNorm, FastDLLMRelaxMLP)
@@ -775,7 +775,7 @@ def make_probe(kind: str, inner_or_cfg, *, dtype: str, hidden_size: int, num_hea
     if kind == "one":
         probe, args = OneInput(inner_or_cfg), {"x": x}
     elif kind == "two":
-        bias = nn.spec.Tensor([1, num_heads, "seq_len", "seq_len"], "float32")
+        bias = nn.spec.Tensor([1, 1, "seq_len", "seq_len"], "float32")  # broadcast over heads
         probe, args = TwoInput(inner_or_cfg), {"x": x, "attention_bias": bias}
     elif kind == "logits":
         probe, args = Logits(inner_or_cfg, dtype), {"x": x}
