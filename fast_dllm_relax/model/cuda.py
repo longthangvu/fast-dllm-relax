@@ -177,19 +177,6 @@ def build_prefix_block_attention_bias(
     return bias_2d[None, None, :, :]
 
 
-def build_cached_attention_bias(
-    prefix_len: int,
-    block_len: int,
-    num_attention_heads: int,
-    dtype: str = "float32",
-) -> np.ndarray:
-    """All-zeros bias for the cache-aware active-block forward.
-    Shape: [1, num_heads, block_len, prefix_len + block_len].
-    Valid only when prefix_len % block_size == 0 (the active block then sees the whole prefix).
-    """
-    return np.zeros((1, num_attention_heads, block_len, prefix_len + block_len), dtype=dtype)
-
-
 def extract_shifted_block_logits(
     logits: np.ndarray,
     *,
