@@ -68,6 +68,101 @@ METAL_MATMUL_CONFIGS: dict[tuple[int, int, int], dict] = {
 }
 
 
+def _rocm_cfg(bx: int, by: int, mx: int, my: int, mk: int, vec: int = 2) -> "dlight.gpu.Matmul.Config":
+    return dlight.gpu.Matmul.Config(block_size_x=bx, block_size_y=by, vthread_x=1, vthread_y=1,
+                                    micro_size_x=mx, micro_size_y=my, micro_size_k=mk, vector_size=vec,
+                                    unroll=256, use_shared=True, storage_align=True, inner_x=False)
+
+
+# dlight.gpu.Matmul configs per static GEMM shape (M, N, K) for ROCm, picked by a timing sweep on
+# Strix Halo (gfx1151, wave32); used for the fp16 logits GEMM, and for the projections when the WMMA
+# kernels are off. dlight's default
+# rocm config (8, 16, 4, 4, 16) is the CUDA one and runs gate_up/lm_head 3.4-5.5x slower than
+# hipBLASLt; these bring every decode GEMM within 0.8-1.6x of it. Unlisted shapes keep the default.
+ROCM_MATMUL_CONFIGS: dict[tuple[int, int, int], "dlight.gpu.Matmul.Config"] = {
+    (8, 2048, 1536): _rocm_cfg(8, 16, 2, 2, 16),       # qkv
+    (8, 1536, 1536): _rocm_cfg(16, 8, 1, 2, 16),       # o_proj
+    (32, 1536, 1536): _rocm_cfg(16, 8, 2, 2, 16),
+    (8, 17920, 1536): _rocm_cfg(16, 8, 1, 2, 16),      # gate_up
+    (32, 17920, 1536): _rocm_cfg(16, 16, 2, 2, 16),
+    (8, 1536, 8960): _rocm_cfg(8, 16, 2, 2, 16),       # down_proj
+    (32, 1536, 8960): _rocm_cfg(8, 16, 2, 2, 16),
+    (8, 151936, 1536): _rocm_cfg(16, 8, 1, 2, 16),     # tied lm_head
+    (32, 151936, 1536): _rocm_cfg(16, 8, 2, 2, 16),
+}
+
+
+# Dynamic-M (prefill / scoring) weight GEMMs on ROCm, keyed by static (N, K): sweep at M = 128 / 512
+# on gfx1151 (e4e). About 23% less weight-GEMM time at M=512 than dlight's default; still ~3x
+# hipBLASLt there (compute-bound, dlight has no RDNA WMMA path).
+ROCM_MATMUL_DYN_CONFIGS: dict[tuple[int, int], "dlight.gpu.Matmul.Config"] = {
+    (17920, 1536): _rocm_cfg(32, 8, 4, 8, 16, 4),      # gate_up
+    (1536, 8960): _rocm_cfg(32, 8, 4, 8, 8, 2),        # down_proj
+    (2048, 1536): _rocm_cfg(32, 8, 4, 8, 8, 2),        # qkv
+    (1536, 1536): _rocm_cfg(32, 8, 4, 8, 8, 2),        # o_proj
+}
+
+
+# Attention probs x V (fp32 x fp32, dynamic KV length) on ROCm: dlight's default tile gives only
+# 24 workgroups for the [2, 192, 128] decode output; this one gives 192 and is 2-2.9x faster on
+# gfx1151 for KV lengths 32..4128 (decode refine at P=512: 59.5 -> 23.6 us per layer).
+ROCM_ATTN_PV_CONFIG = _rocm_cfg(16, 16, 2, 2, 8, 1)
+
+
+# Fused int4 dequant+matmul (model/rocm_linear.py) on ROCm, per static (M, N, K): swept on gfx1151
+# (cold cache). Brings the int4 decode GEMMs on par with AMD AITER gemm_a16w4 (qkv/o_proj faster,
+# down slower) without leaving TVM.
+ROCM_INT4_MATMUL_CONFIGS: dict[tuple[int, int, int], "dlight.gpu.Matmul.Config"] = {
+    (8, 2048, 1536): _rocm_cfg(8, 8, 1, 2, 32),        # qkv
+    (32, 2048, 1536): _rocm_cfg(8, 8, 4, 4, 32),
+    (8, 1536, 1536): _rocm_cfg(8, 8, 1, 2, 32),        # o_proj
+    (32, 1536, 1536): _rocm_cfg(4, 8, 4, 2, 32),
+    (8, 17920, 1536): _rocm_cfg(8, 8, 1, 2, 32),       # gate_up
+    (32, 17920, 1536): _rocm_cfg(4, 16, 8, 4, 32),
+    (8, 1536, 8960): _rocm_cfg(4, 16, 2, 2, 32),       # down_proj
+    (32, 1536, 8960): _rocm_cfg(4, 8, 4, 2, 32),
+}
+
+
+# Dynamic-M (prefill / scoring) fused int4 GEMMs on ROCm: one config, at or near the best of a 157-config
+# sweep for all four projection shapes at M = 128 and 512 on gfx1151 (-26% weight-GEMM time at M=512).
+# Used when the WMMA kernels in model/rocm_wmma.py are off; those are ~3x faster at these shapes.
+ROCM_INT4_DYN_CONFIG = _rocm_cfg(16, 8, 4, 8, 32)
+
+
+def _has_dequantize_block(sch) -> bool:
+    return any(sch.get(b).name_hint == "dequantize" for b in sch.get_child_blocks(get_root_block(sch)))
+
+
+def _rocm_weight_cfg(block: tirx.SBlock) -> "dlight.gpu.Matmul.Config | None":
+    """Tuned ROCm Matmul config for a weight GEMM: by static (M, N, K), else by (N, K) if M is dynamic."""
+    mnk = _static_mnk(block)
+    if mnk is not None:
+        return ROCM_MATMUL_CONFIGS.get(mnk)
+    spatial, reduce = [], []
+    for iv in block.iter_vars:
+        (reduce if iv.iter_type == tirx.IterVar.CommReduce else spatial).append(iv.dom.extent)
+    if not spatial or not reduce or not isinstance(spatial[-1], tirx.IntImm):
+        return None
+    if not all(isinstance(e, tirx.IntImm) for e in reduce):
+        return None
+    k = 1
+    for e in reduce:
+        k *= int(e)
+    return ROCM_MATMUL_DYN_CONFIGS.get((int(spatial[-1]), k))
+
+
+class _ConfiguredMatmul(dlight.gpu.Matmul):
+    """dlight.gpu.Matmul with a fixed Config (instead of the per-target default)."""
+
+    def __init__(self, config: "dlight.gpu.Matmul.Config"):
+        super().__init__()
+        self._config = config
+
+    def get_configs(self, target):  # noqa: ARG002
+        return self._config
+
+
 def _static_mnk(block: tirx.SBlock) -> tuple[int, int, int] | None:
     """(M, N, K) of a matmul block C[..., M, N] += A[..., M, K] * B[N, K] with static extents:
     N = last spatial iter, M = product of the other spatial iters, K = product of the reduction
@@ -86,6 +181,17 @@ def _static_mnk(block: tirx.SBlock) -> tuple[int, int, int] | None:
     for e in reduce:
         k *= e
     return m, spatial[-1], k
+
+
+def _reads_static_2d_weight(block: tirx.SBlock) -> bool:
+    """True if the matmul block reads a 2-D buffer with static extents (a [N, K] model weight, as in
+    the projection GEMMs and the tied lm_head). The attention score/value matmuls read only
+    batched (>= 3-D), dynamic-shape activations."""
+    for region in block.reads:
+        shape = region.buffer.shape
+        if len(shape) == 2 and all(isinstance(d, tirx.IntImm) for d in shape):
+            return True
+    return False
 
 
 class MatmulMetalMixedPrecision(dlight.gpu.Matmul):
@@ -112,10 +218,31 @@ class MatmulMetalMixedPrecision(dlight.gpu.Matmul):
             return None
         sch = s_tir.Schedule(func)
         reduction_blocks = get_reduction_blocks(sch, sch.get_child_blocks(get_root_block(sch)))
+        if reduction_blocks is not None and target.kind.name == "rocm" and _has_dequantize_block(sch):
+            # Fused int4 dequant+matmul (rocm_linear.RocmW4Linear): int4-tuned configs, else default Matmul.
+            mnk = _static_mnk(sch.get(reduction_blocks[0]))
+            cfg4 = ROCM_INT4_MATMUL_CONFIGS.get(mnk) if mnk is not None else ROCM_INT4_DYN_CONFIG
+            if cfg4 is not None:
+                return _ConfiguredMatmul(cfg4).apply(func, target, tunable)
+            return super().apply(func, target, tunable)
         if reduction_blocks is not None:
             in_dtype, out_dtype = get_in_out_dtypes(sch.get(reduction_blocks[0]))
             cfg = METAL_MATMUL_CONFIGS.get(_static_mnk(sch.get(reduction_blocks[0])))
             if in_dtype != out_dtype:
+                if target.kind.name == "rocm" and _reads_static_2d_weight(sch.get(reduction_blocks[0])):
+                    # Weight GEMMs (fp16 x fp16 -> fp32 from AccumulateMatmulFP32): the generic
+                    # Matmul schedule handles them; Fallback made the tied lm_head ~35x slower on
+                    # gfx1151 (258 ms vs 7 ms). The attention matmuls still take Fallback below.
+                    rocm_cfg = _rocm_weight_cfg(sch.get(reduction_blocks[0]))
+                    if rocm_cfg is not None:
+                        return _ConfiguredMatmul(rocm_cfg).apply(func, target, tunable)
+                    return super().apply(func, target, tunable)
+                if target.kind.name == "rocm":
+                    # Attention score matmuls (batched, dynamic, fp16 x fp16 -> fp32): generic Matmul
+                    # compiles and terminates on rocm with this TVM (no Simplify hang), gives
+                    # bit-identical outputs to Fallback and is ~4x faster on them (512-token
+                    # prefill 425 -> 237 ms on gfx1151).
+                    return super().apply(func, target, tunable)
                 if target.kind.name == "metal":
                     try:
                         mma = MetalMatmul(**(cfg or {})).apply(func, target, tunable)
@@ -124,6 +251,11 @@ class MatmulMetalMixedPrecision(dlight.gpu.Matmul):
                     if mma is not None:
                         return mma
                 return dlight.gpu.Fallback().apply(func, target, tunable)
+            if target.kind.name == "rocm":
+                mnk = _static_mnk(sch.get(reduction_blocks[0]))
+                rocm_cfg = ROCM_MATMUL_CONFIGS.get(mnk) if mnk is not None else ROCM_ATTN_PV_CONFIG
+                if rocm_cfg is not None:
+                    return _ConfiguredMatmul(rocm_cfg).apply(func, target, tunable)
             if cfg is not None and target.kind.name == "metal":
                 try:
                     tuned = MetalMatmul(**cfg).apply(func, target, tunable)
