@@ -122,8 +122,10 @@ def test_metal_cross_compile(narrow_i32, tmp_path):
         assert info["long_count"] > 0  # symbolic-shape kernels index in int64 without narrowing
 
 
-_DEVICES = [kind for kind, ok in (("cuda", _has_cuda), ("metal", tvm.metal(0).exist)) if ok]
-needs_gpu = pytest.mark.skipif(not _DEVICES, reason="no CUDA or Metal device")
+_has_rocm = tvm.rocm(0).exist
+_DEVICES = [kind for kind, ok in (("cuda", _has_cuda), ("metal", tvm.metal(0).exist), ("rocm", _has_rocm)) if ok]
+needs_gpu = pytest.mark.skipif(not _DEVICES, reason="no CUDA, Metal or ROCm device")
+_NATIVE_DEVICES = [kind for kind in _DEVICES if kind in ("metal", "rocm")]
 
 
 @functools.cache
@@ -140,6 +142,17 @@ def _compiled_native_metal():
     return relax.VirtualMachine(ex, tvm.metal(0)), named
 
 
+@functools.cache
+def _compiled_native_rocm():
+    """(VirtualMachine, named params) for the tiny tied fp16 native model, as exported for ROCm
+    (opt_fast_dllm_llm_native, default int64 device indexing, wave32 target on RDNA)."""
+    from fast_dllm_relax.targets.rocm import rocm_target
+
+    mod, named = _export(FastDLLMRelaxForCausalLMNative, "float16", tied=True)
+    ex = tvm.compile(mod, rocm_target(), relax_pipeline=relax.get_pipeline("opt_fast_dllm_llm_native"))
+    return relax.VirtualMachine(ex, tvm.rocm(0)), named
+
+
 def _tiny_setup(kind: str, seed: int):
     """(cfg, dev, vm, params, rand) for the tiny tied fp16 model on `kind` ("cuda": CUDA model, cuBLAS
     pipeline; "metal": native model, Metal pipeline); rand(shape) -> random fp16 TVM tensor."""
@@ -147,6 +160,9 @@ def _tiny_setup(kind: str, seed: int):
     if kind == "cuda":
         dev = tvm.cuda(0)
         _, vm, named = _compiled_cublas(True)
+    elif kind == "rocm":
+        dev = tvm.rocm(0)
+        vm, named = _compiled_native_rocm()
     else:
         dev = tvm.metal(0)
         vm, named = _compiled_native_metal()
@@ -173,11 +189,12 @@ def _prefill(vm, params, dev, embed, k, v):
     dev.sync()
 
 
-@pytest.mark.skipif(not tvm.metal(0).exist, reason="no Metal device")
-def test_static_variants_match_dynamic():
+@pytest.mark.skipif(not _NATIVE_DEVICES, reason="no Metal or ROCm device")
+@pytest.mark.parametrize("kind", _NATIVE_DEVICES)
+def test_static_variants_match_dynamic(kind):
     """Each static-shape function computes exactly what its dynamic sibling computes at the static
-    size (Metal pipeline, int32-narrowed, as exported), including the cache rows it writes."""
-    cfg, dev, vm, params, rand = _tiny_setup("metal", 3)
+    size (native pipeline as exported for Metal or ROCm), including the cache rows it writes."""
+    cfg, dev, vm, params, rand = _tiny_setup(kind, 3)
     HS, PLEN, BSIZ, SBS = cfg.hidden_size, 64, cfg.bd_size, cfg.bd_size // 4
     prefix, active = rand((1, PLEN, HS)), rand((1, BSIZ, HS))
     caches = {}
@@ -363,3 +380,57 @@ def test_native_matches_callback_attention_on_cuda():
     for a, b in zip(run(vm_n), run(vm_c)):
         assert np.isfinite(a).all() and np.isfinite(b).all()
         np.testing.assert_allclose(a, b, rtol=1e-2, atol=1e-2)
+
+
+def _int4_native(wmma: bool):
+    """Tiny tied native model with int4 (RocmW4Linear) projections; random packed weights / scales."""
+    from fast_dllm_relax.model.rocm_linear import PROJECTIONS, swap_projections
+
+    cfg = tiny_config(tied=True)
+    model = FastDLLMRelaxForCausalLMNative(cfg, dtype="float16", fused_qkv=True, fused_gate_up=True)
+    swap_projections(model, cfg, "float16", dict.fromkeys(PROJECTIONS, "w4"), wmma=wmma)
+    mod, named = model.export_tvm(spec=model.get_default_spec())
+    rng = np.random.default_rng(0)
+    params = {}
+    for name, p in named:
+        shape = tuple(int(d) for d in p.shape)
+        if p.dtype == "uint32":
+            params[name] = rng.integers(0, 2**32, size=shape, dtype=np.uint64).astype(np.uint32)
+        elif name.endswith("weight_scales"):
+            params[name] = np.full(shape, 0.01, dtype="float16")
+        elif "norm" in name:
+            params[name] = np.ones(shape, dtype="float16")
+        else:
+            params[name] = (rng.standard_normal(shape) * 0.02).astype("float16")
+    return cfg, mod, params
+
+
+@pytest.mark.skipif(not _has_metal_codegen, reason="TVM built without Metal codegen")
+def test_int4_metal_cross_compile(tmp_path):
+    """The portable int4 path (fused TE dequant+matmul, no WMMA) builds for Metal."""
+    from fast_dllm_relax.targets.metal import metal_target
+
+    _, mod, _ = _int4_native(wmma=False)
+    ex = tvm.compile(mod, metal_target(), relax_pipeline=relax.get_pipeline("opt_fast_dllm_llm_native"))
+    ex.export_library(str(tmp_path / "tiny_int4.tar"))
+
+
+@pytest.mark.skipif(not _has_rocm, reason="no ROCm device")
+def test_int4_wmma_matches_portable_path():
+    """Dynamic-M int4 projections: RDNA WMMA kernel == portable TE/dlight path (forward_hidden)."""
+    from fast_dllm_relax.targets.rocm import rocm_target
+
+    dev = tvm.rocm(0)
+    outs = []
+    for wmma in (False, True):
+        cfg, mod, params = _int4_native(wmma)
+        ex = tvm.compile(mod, rocm_target(), relax_pipeline=relax.get_pipeline("opt_fast_dllm_llm_native"))
+        vm = relax.VirtualMachine(ex, dev)
+        plen = 96
+        rng = np.random.default_rng(1)
+        embed = tvm.runtime.tensor((rng.standard_normal((1, plen, cfg.hidden_size)) * 0.5).astype("float16"), dev)
+        bias = tvm.runtime.tensor(build_prefix_block_attention_bias(0, plen, block_size=32), dev)
+        outs.append(vm["forward_hidden"](embed, bias, [tvm.runtime.tensor(v, dev) for v in params.values()]).numpy())
+    a, b = (o.astype("float32") for o in outs)
+    assert np.isfinite(a).all() and np.isfinite(b).all()
+    np.testing.assert_allclose(b, a, rtol=2e-2, atol=2e-2)
