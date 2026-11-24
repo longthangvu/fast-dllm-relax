@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Time the cached decode building blocks of a CUDA Relax artifact (runtime-level, synced medians).
+"""Time the cached decode building blocks of a Relax artifact (runtime-level, synced medians).
 
   python scripts/bench_cached_step.py --artifact-dir artifacts/fast_dllm_relax_bf16 --out results/x.json
+  python scripts/bench_cached_step.py --device rocm:0 --artifact-dir artifacts/fast_dllm_relax_fp16_rocm_gfx1151
 
 Measures, at each prefix length P:
   refine   one refinement full step (embed + cached forward + get_logits + torch reductions)
@@ -48,16 +49,18 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--out", default=None, help="write the results as JSON here")
+    parser.add_argument("--device", default="cuda:0", help="TVM device: cuda:0 (default), rocm:0, ...")
     args = parser.parse_args()
 
-    runner = FastDLLMRelaxRunner(artifact_dir=args.artifact_dir, load_model=True)
+    runner = FastDLLMRelaxRunner(artifact_dir=args.artifact_dir, device=args.device, load_model=True)
     vm, params, dev, reshape = runner.vm, runner.params, runner.dev, runner.reshape
     heads = runner.hf_config.num_attention_heads
     bs, sbs = runner.block_size, runner.small_block_size
 
     def sync() -> None:
         dev.sync()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():  # CUDA, or ROCm under a ROCm build of torch
+            torch.cuda.synchronize()
 
     rng = np.random.default_rng(0)
     prefix_lens = [int(p) for p in args.prefix_lens.split(",")]

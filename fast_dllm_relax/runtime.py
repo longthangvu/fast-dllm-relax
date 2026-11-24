@@ -82,13 +82,16 @@ def _kv_write_packed(k_nd, v_nd, k_cache_nd, v_cache_nd, layer, start):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# Device-dispatch helpers. CUDA tensors use a zero-copy torch.from_dlpack view; other TVM devices
-# (Metal) go through a .numpy() host copy (unified memory there).
+# Device-dispatch helpers. CUDA and ROCm tensors use a zero-copy torch.from_dlpack view (a ROCm
+# build of PyTorch imports kDLROCM tensors as its "cuda" device); other TVM devices (Metal) go
+# through a .numpy() host copy (unified memory there).
 _KDL_CUDA = 2
+_KDL_ROCM = 10
 
 
 def _is_cuda(t: Any) -> bool:
-    return t.device.dlpack_device_type() == _KDL_CUDA
+    """True for tensors torch can view zero-copy: CUDA, or ROCm under a ROCm build of PyTorch."""
+    return t.device.dlpack_device_type() in (_KDL_CUDA, _KDL_ROCM)
 
 
 def _tvm_to_torch(t: Any) -> torch.Tensor:

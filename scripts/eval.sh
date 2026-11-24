@@ -12,7 +12,7 @@
 #   BACKEND       hf | relax                    (required)
 #   TASK          see above                     (required)
 #   ARTIFACT_DIR  Relax artifact directory      (default artifacts/fast_dllm_relax_bf16)
-#   DEVICE        cuda:0 | metal:0 | ...        (default cuda:0)
+#   DEVICE        cuda:0 | metal:0 | rocm:0 | ... (default cuda:0)
 #   CHUNKED=1     Relax only: chunked prefix-cache prefill (recommended on Jetson)
 #   BLOCK_CACHE=0 generative tasks: disable the per-sub-block partial forwards (default 1)
 #   LIMIT         lm-eval --limit, for smoke runs (default: full dataset)

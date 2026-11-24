@@ -4,6 +4,7 @@
 #   bash scripts/setup_tvm.sh cuda     # desktop CUDA workstation (default; also cross-compiles)
 #   bash scripts/setup_tvm.sh jetson   # on a Jetson Orin
 #   bash scripts/setup_tvm.sh mac      # on an Apple-silicon Mac
+#   bash scripts/setup_tvm.sh rocm     # on an AMD ROCm GPU machine (e.g. Strix Halo gfx1151)
 #
 # Env:
 #   CUDA_ARCH   value for CMAKE_CUDA_ARCHITECTURES (e.g. 89, or 87 on Orin). Unset: TVM picks a
@@ -18,7 +19,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 tvm="$root/3rdparty/tvm"
 patch="$root/patches/tvm-a7bfc857b.patch"
 config="$root/configs/tvm/${preset}.cmake"
-[ -f "$config" ] || { echo "unknown preset '$preset' (cuda|jetson|mac)" >&2; exit 1; }
+[ -f "$config" ] || { echo "unknown preset '$preset' (cuda|jetson|mac|rocm)" >&2; exit 1; }
 
 git -C "$root" submodule update --init --recursive
 
