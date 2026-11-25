@@ -10,6 +10,7 @@ Hugging Face reference implementation on nine lm-eval tasks. The repo covers thr
 | Desktop NVIDIA GPU (default) | bf16 or fp16, cuBLAS + CUTLASS + dlight | the GPU machine | the GPU machine |
 | Jetson Orin | bf16 or fp16, cuBLAS + dlight (no CUTLASS) | x86_64 workstation (cross-compile) | Jetson Orin |
 | Apple-silicon Mac (Metal) | fp16 (default) or bf16, dlight + tuned simdgroup-MMA GEMMs, in-graph KV cache and attention, int32 kernel indexing | x86_64 workstation (cross-compile), or the Mac | Mac (linked there) |
+| AMD ROCm GPU (Strix Halo, gfx1151) | fp16 / bf16, or int8 / int4 weight-only (AMD Quark GPTQ for int4); RDNA WMMA kernels + tuned dlight configs (wave32), in-graph KV cache and attention | the AMD machine | the AMD machine |
 
 The compiled model keeps the Fast-dLLM v2 decoding algorithm: 32-token blocks, refined in 8-token
 sub-blocks, with every position above a 0.9 confidence threshold unmasked in parallel. It also
@@ -34,20 +35,26 @@ desktop GPU workstation, a Jetson Orin NX and a Mac M4. Labels show the Relax/HF
 ```
 3rdparty/tvm/            apache/tvm submodule, pinned at a7bfc857b
 patches/                 local TVM patch (applied by scripts/setup_tvm.sh)
-configs/tvm/             config.cmake presets: cuda, jetson, mac
+configs/tvm/             config.cmake presets: cuda, jetson, mac, rocm
 fast_dllm_relax/
   model/cuda.py          Relax model + opt_fast_dllm_llm_cublas pipeline (desktop GPU, Jetson)
-  model/metal.py         in-graph KV-cache/attention variant + opt_fast_dllm_llm_native pipeline (Metal)
+  model/metal.py         in-graph KV-cache/attention variant + opt_fast_dllm_llm_native pipeline (Metal, ROCm)
+  model/rocm_wmma.py     RDNA (gfx11) WMMA GEMM kernels in TIR: fp16, bf16, int8 and int4 weights (ROCm)
+  model/rocm_linear.py   ROCm projection layers (fp16/bf16, int8, int4), precision presets, int8 logits
+  quark_int4.py          AMD Quark int4 checkpoint -> int4 projection layout
   runtime.py             block-diffusion decoding loop, KV/block caches, loglikelihood scoring
   runners.py             HF baseline runner and Relax runner (shared metrics/recording)
   lm_eval_harness.py     lm-eval model types `fast_dllm_baseline` and `fast_dllm_relax`
   cli.py                 single-prompt demo / quick benchmark
-  targets/               Jetson and Metal cross-compile helpers
+  targets/               Jetson and Metal cross-compile helpers, ROCm target
 scripts/
   setup_tvm.sh           build the patched TVM
   export_cuda.py         export desktop-GPU / Jetson artifacts
   export_metal.py        export the Metal artifact (cross-compile, or natively on the Mac)
   link_metal.py          (on the Mac) link + load-check the Metal artifact
+  export_rocm.py         export the AMD ROCm artifact (built and run on the AMD machine)
+  quantize_quark.py      int4 weight-only quantization with AMD Quark (GPTQ, block-diffusion calibration)
+  export_rocm_quant.py   export a quantized AMD ROCm artifact (int8 / int4 projections)
   eval.sh                run one benchmark task
 lm_eval_tasks/           local copies of lm-eval task configs (see "Benchmarks")
 tests/                   tiny-config compile tests (no checkpoint needed)
@@ -105,6 +112,24 @@ CUTLASS, no LLVM). Then install the Python packages as above, using the JetPack 
 Install Xcode Command Line Tools and Homebrew LLVM. Build the runtime on the Mac with
 `bash scripts/setup_tvm.sh mac` (Metal + LLVM). Then install the Python packages as above.
 
+### AMD ROCm (Strix Halo / Radeon 8060S, gfx1151)
+
+Requirements: ROCm (validated with 7.2.1), an LLVM with `llvm-config` that knows the GPU arch
+(ROCm's own LLVM has no `llvm-config`; Ubuntu's `llvm-20-dev` + `libpolly-20-dev` know gfx1150-1153),
+cmake and ninja, a ROCm build of PyTorch (`pip install torch --index-url
+https://download.pytorch.org/whl/rocm7.1`), and the user in the `render` group.
+
+```bash
+PATH=/usr/lib/llvm-20/bin:$PATH INSTALL_PY=1 bash scripts/setup_tvm.sh rocm
+export TVM_LIBRARY_PATH=$PWD/3rdparty/tvm/build
+export PYTHONPATH=$PWD/3rdparty/tvm/python:$PWD
+pytest tests/          # the in-place KV-cache tests run on rocm
+```
+
+Other AMD GPUs: set `FAST_DLLM_ROCM_ARCH` (e.g. `gfx1150` for Ryzen AI 300/400 iGPUs) or pass
+`--arch` to the export. RDNA GPUs use `thread_warp_size=32` (TVM's rocm default is 64). The tuned
+GEMM configs in `model/metal.py` (`ROCM_MATMUL_CONFIGS`) were picked on gfx1151.
+
 ## Export
 
 All exports load the checkpoint at its pinned HF revision (`25093b6f…`). They write to `artifacts/`.
@@ -122,6 +147,15 @@ python scripts/export_cuda.py --target jetson_orin   # -> artifacts/fast_dllm_re
 # Then link on the Mac.
 python scripts/export_metal.py                    # -> artifacts/fast_dllm_relax_fp16_metal/
 python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal   # on the Mac
+
+# AMD ROCm: build and run on the same machine (smoke-runs the in-place cache functions on rocm:0)
+python scripts/export_rocm.py                     # -> artifacts/fast_dllm_relax_fp16_rocm_gfx1151/
+python scripts/export_rocm.py --dtype bfloat16     # -> ..._bf16_rocm_gfx1151/ (the checkpoint's dtype)
+# AMD ROCm, quantized (fp16 attention, int8 logits; see the ROCm note below for the trade-offs)
+python scripts/export_rocm_quant.py --preset int8-mlp   # int8 MLP, no calibration -> ..._int8-mlp/
+python scripts/quantize_quark.py --scheme int4_wo_128 --algo gptq --calib mix --nsamples 256 \
+    --exclude "*q_proj,*k_proj,*v_proj,*o_proj" --out quant/fdllm_q4gptq_mlp   # AMD Quark, GPU, ~1 h
+python scripts/export_rocm_quant.py --preset int4-mlp --quark quant/fdllm_q4gptq_mlp   # -> ..._int4-mlp/
 ```
 
 A native export takes a few minutes and ends with a smoke run of every exported function. It
@@ -144,6 +178,7 @@ BACKEND=hf    TASK=gsm8k bash scripts/eval.sh
 LIMIT=5 BACKEND=relax TASK=ifeval bash scripts/eval.sh          # smoke run
 BACKEND=relax TASK=gsm8k CHUNKED=1 ARTIFACT_DIR=artifacts/fast_dllm_relax_bf16_jetson_orin bash scripts/eval.sh   # Jetson
 BACKEND=relax TASK=gsm8k DEVICE=metal:0 ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_metal bash scripts/eval.sh  # Mac
+BACKEND=relax TASK=gsm8k DEVICE=rocm:0 ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_rocm_gfx1151 bash scripts/eval.sh  # AMD ROCm
 ```
 
 | `TASK` | lm-eval task | Type |
@@ -207,6 +242,14 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
   2. `python scripts/link_metal.py --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
   3. `python -m fast_dllm_relax.cli --backend relax --use-block-cache --device metal:0 --artifact-dir artifacts/fast_dllm_relax_fp16_metal`
 
+- **AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S iGPU, gfx1151; ROCm 7.2.1, kernel 7.0).** The fp16,
+  bf16, int8-MLP and int4-MLP artifacts were built and run natively and evaluated with `scripts/eval.sh`
+  against the HF baseline (ROCm PyTorch 2.10.0+rocm7.1, SDPA math path, the checkpoint's native bf16) on
+  GSM8K, MMLU, MATH, IFEval, HumanEval(+) and MBPP(+); `pytest tests/` passes on the device. To check:
+  1. `PATH=/usr/lib/llvm-20/bin:$PATH INSTALL_PY=1 bash scripts/setup_tvm.sh rocm`
+  2. `python scripts/export_rocm_quant.py --preset int8-mlp`
+  3. `BACKEND=relax TASK=gsm8k DEVICE=rocm:0 ARTIFACT_DIR=artifacts/fast_dllm_relax_fp16_rocm_gfx1151_int8-mlp bash scripts/eval.sh`
+
 ## Notes
 
 - **In-place KV cache.** Each sequence gets one preallocated cache, `[layers, 1, capacity, kv_heads,
@@ -253,6 +296,35 @@ summary with aggregate throughput and memory (`lm_eval_summary.json`).
   each step's logits to the per-row argmax and max softmax probability on the GPU. Opt-outs for A/B
   runs: `FAST_DLLM_DISABLE_B32=1`, `FAST_DLLM_DISABLE_STATIC_LOGITS=1`,
   `FAST_DLLM_DISABLE_GPU_CONFIDENCE=1`.
+
+- **ROCm.** The ROCm build reuses the native model and `opt_fast_dllm_llm_native`. On rocm,
+  `MatmulMetalMixedPrecision` sends the fp16 x fp16 -> fp32 weight GEMMs (from `AccumulateMatmulFP32`)
+  and the attention matmuls to dlight `Matmul` instead of `Fallback` (Fallback made them 5-35x slower),
+  with per-shape configs (`ROCM_MATMUL_CONFIGS`, `ROCM_MATMUL_DYN_CONFIGS`) when the WMMA kernels are off. TVM's hipBLAS BYOC does
+  not build against ROCm 7 at the pinned commit, so the preset leaves it off. If a ROCm PyTorch
+  wheel bundles an older HSA runtime than the installed driver stack supports (seen with
+  torch 2.10.0+rocm7.1 on kernel 7.0: segfault at the first queue creation), preload the system one:
+  `LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1`. `import tvm` imports torch, so this affects TVM too.
+- **ROCm kernels and precision.** `model/rocm_wmma.py` has hand-written RDNA (gfx11) WMMA GEMM
+  kernels (`llvm.amdgcn.wmma.f32.16x16x16.{f16,bf16}`, wave32, fp32 accumulation). `export_rocm.py`
+  uses them for all projections on gfx11 by default (`--no-wmma` keeps the dlight GEMMs). Dynamic-M
+  calls (prefill, scoring) use multi-row tiles; decode calls (8 / 32 rows) use per-shape tiles picked
+  on gfx1151 (`WMMA_*_DECODE_TILES`). The attention probs x V matmul uses `ROCM_ATTN_PV_CONFIG`.
+  `export_rocm_quant.py` sets each projection type (qkv, o, gate_up, down) to fp16, int8 or int4:
+  - `--preset int8-mlp`: int8 MLP, fp16 attention. Weight-only int8, group 128, round-to-nearest
+    (zero point 128); no calibration. Matches the fp16 artifact's accuracy on the benchmarks above.
+  - `--preset int4-mlp`: int4 MLP from an AMD Quark GPTQ export (`scripts/quantize_quark.py`;
+    symmetric int4, group 128; `fast_dllm_relax/quark_int4.py` converts the signed-nibble AWQ packing
+    bit-exactly). Fastest; int4 costs accuracy mainly on math and code tasks (MATH, MBPP+), less on
+    GSM8K. int4 attention projections cost more accuracy than they save, hence fp16 attention.
+  - `--precision qkv=..,o=..,gate_up=..,down=..` for other mixes (`f16` | `w8` | `w4`).
+  Both presets add an int8 copy of the tied embedding for the logits (`--no-lm-head-w8` to disable).
+  The quantized weights are decoded into shared memory once per thread block. gfx1151 has fp16/bf16/
+  int8/int4 WMMA but no fp8/fp4 instructions, hence the int8/int4 formats. `FAST_DLLM_ROCM_WMMA=0` at
+  export time disables the WMMA kernels (int4 falls back to a portable fused TE dequant+matmul,
+  which also builds for Metal; int8 needs WMMA). `pytest tests/test_rocm_wmma.py` checks every
+  kernel against numpy on a gfx11 device. Other RDNA 3 / 3.5 GPUs (gfx110x, gfx115x) use the same
+  kernels with the gfx1151 tiles; gfx12 is not supported by these kernels.
 
 ## Citation
 

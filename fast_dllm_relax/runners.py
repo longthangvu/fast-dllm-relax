@@ -623,7 +623,7 @@ class FastDLLMRelaxRunner(ResultRecorder):
             except Exception:
                 raise RuntimeError(
                     f"Relax artifact is missing cache-aware global '{_fn_name}'. "
-                    "Re-export the artifact with scripts/export_cuda.py (or scripts/export_metal.py)."
+                    "Re-export the artifact with scripts/export_cuda.py (or scripts/export_metal.py / scripts/export_rocm.py)."
                 ) from None
         try:
             self.vm["forward_block_partial_rp0"]
@@ -632,9 +632,10 @@ class FastDLLMRelaxRunner(ResultRecorder):
             self._has_block_cache = False
         # Metal artifacts built with int32 device indexing record a total-length cap; CUDA/Jetson
         # artifacts have no manifest, hence no cap.
-        manifest_path = self.artifact_dir / "fast_dllm_relax_nn_metal_manifest.json"
-        if manifest_path.exists():
-            self.max_total_len = json.loads(manifest_path.read_text(encoding="utf-8")).get("max_total_len")
+        for manifest_name in ("fast_dllm_relax_nn_metal_manifest.json", "fast_dllm_relax_nn_rocm_manifest.json"):
+            manifest_path = self.artifact_dir / manifest_name
+            if manifest_path.exists():
+                self.max_total_len = json.loads(manifest_path.read_text(encoding="utf-8")).get("max_total_len")
         self.param_names = param_names_path.read_text(encoding="utf-8").splitlines()
         self.params = self._load_params(params_path, self.param_names)
         self.reshape = tvm.get_global_func("vm.builtin.reshape")
@@ -988,8 +989,14 @@ class FastDLLMRelaxRunner(ResultRecorder):
                 _, index = device.split(":", 1)
                 return tvm.device("metal", int(index))
             return tvm.device("metal", 0)
+        if device.startswith("rocm"):  # AMD ROCm artifact (scripts/export_rocm.py)
+            if ":" in device:
+                _, index = device.split(":", 1)
+                return tvm.device("rocm", int(index))
+            return tvm.device("rocm", 0)
         raise ValueError(
-            f"Unsupported TVM device string for Fast-dLLM Relax runner: {device} (expected cuda[:N], cpu[:N] or metal[:N])"
+            f"Unsupported TVM device string for Fast-dLLM Relax runner: {device} "
+            "(expected cuda[:N], cpu[:N], metal[:N] or rocm[:N])"
         )
 
     def _build_prompt_ids(self, prompt: str) -> list[int]:
